@@ -1,0 +1,55 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.{cs,csproj,slnx,props,targets}]
+indent_size = 4
+
+[*.{json,yml,yaml,md}]
+indent_size = 2
+
+[*.cs]
+# ----------------------------------------------------------------------------
+# Naming conventions
+# ----------------------------------------------------------------------------
+# Private/internal instance fields are camelCase WITHOUT an underscore prefix.
+# (Rules are evaluated top-down; const and static-readonly fields are matched by
+# the earlier PascalCase rules, so this rule only governs ordinary fields.)
+
+dotnet_naming_rule.constant_fields_pascal.severity = warning
+dotnet_naming_rule.constant_fields_pascal.symbols  = constant_fields
+dotnet_naming_rule.constant_fields_pascal.style    = pascal_case
+
+dotnet_naming_rule.static_readonly_fields_pascal.severity = warning
+dotnet_naming_rule.static_readonly_fields_pascal.symbols  = static_readonly_fields
+dotnet_naming_rule.static_readonly_fields_pascal.style    = pascal_case
+
+dotnet_naming_rule.private_fields_camel.severity = warning
+dotnet_naming_rule.private_fields_camel.symbols  = private_fields
+dotnet_naming_rule.private_fields_camel.style    = camel_case_no_underscore
+
+dotnet_naming_symbols.constant_fields.applicable_kinds   = field
+dotnet_naming_symbols.constant_fields.required_modifiers = const
+
+dotnet_naming_symbols.static_readonly_fields.applicable_kinds   = field
+dotnet_naming_symbols.static_readonly_fields.required_modifiers = static, readonly
+
+dotnet_naming_symbols.private_fields.applicable_kinds           = field
+dotnet_naming_symbols.private_fields.applicable_accessibilities = private, internal, private_protected
+
+# camelCase with no prefix — a leading underscore is a violation.
+dotnet_naming_style.camel_case_no_underscore.capitalization  = camel_case
+dotnet_naming_style.camel_case_no_underscore.required_prefix =
+
+dotnet_naming_style.pascal_case.capitalization = pascal_case
+
+# Disallow `this.` qualification (since fields are now distinctly named).
+dotnet_style_qualification_for_field    = false:warning
+dotnet_style_qualification_for_property = false:warning
+dotnet_style_qualification_for_method   = false:warning
+dotnet_style_qualification_for_event    = false:warning

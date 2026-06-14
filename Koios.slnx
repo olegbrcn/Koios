@@ -1,0 +1,6 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Koios.Cli/Koios.Cli.csproj" />
+    <Project Path="src/Koios.Core/Koios.Core.csproj" />
+  </Folder>
+</Solution>
