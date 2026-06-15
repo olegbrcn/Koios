@@ -23,10 +23,23 @@ built on Roslyn.
 
 ## Current state
 
-Foundation & HOT-query tier complete (see the README roadmap). CLI commands: `status`,
-`search`, `outline`, `def`, `hover`. No watcher, relational queries, SQLite, or MCP
-server yet — those are the remaining roadmap steps (live edits, relational queries,
-persistence, agent surface).
+Foundation & HOT-query tier and relational queries complete (see the README roadmap).
+CLI commands: `status`, `search`, `outline`, `def`, `hover` (hot); `refs`, `callers`,
+`impls`, `hierarchy`, `diagnostics` (relational, via `SymbolFinder` / compiler
+diagnostics). No watcher, SQLite, or MCP server yet.
+
+Relational notes:
+- `LoadAsync` strips analyzer references after open — an `UnresolvedAnalyzerReference`
+  crashes `SymbolFinder` operations that compute project checksums. We never run
+  analyzers, and compiler diagnostics from `GetDiagnostics` are unaffected.
+- `impls`/`hierarchy` derived results are filtered to source symbols (a metadata
+  interface like `IDisposable` has thousands of BCL implementers); omitted counts
+  are surfaced in `notes`.
+- `diagnostics` is only meaningful on a restored target; missing-reference errors
+  (CS0006/0009/0012/0234/0246) flag the result `degraded` rather than presenting
+  them as real.
+- Each relational handler is wrapped (CLI `WithEngine`) so an unexpected Roslyn
+  error returns `internal_error` instead of a raw stack trace.
 
 ## Conventions (keep these)
 

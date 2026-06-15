@@ -9,9 +9,10 @@ output of grep.
 
 ## Current state
 
-Koios has completed its [foundation and HOT-query tier](#foundation--hot-navigation):
-a warm Roslyn workspace that projects a symbol catalog and answers name/position
-lookups, exposed through a CLI.
+Koios has completed its [foundation and HOT-query tier](#foundation--hot-navigation)
+and its [relational queries](#relational-queries): a warm Roslyn workspace that
+projects a symbol catalog for name/position lookups and runs `SymbolFinder` /
+compiler diagnostics for cross-symbol queries, exposed through a CLI.
 
 | Command | What it does | Tier |
 | --- | --- | --- |
@@ -20,11 +21,22 @@ lookups, exposed through a CLI.
 | `koios outline <file.cs>` | Structural outline (types → members) of a file. | hot |
 | `koios def <file>:<line>:<col>` | Go to definition (positional, via the live semantic model), or `def --id <symbol_id>`. | hot_semantic |
 | `koios hover <file>:<line>:<col>` | Signature, container, XML-doc summary, or `hover --id <symbol_id>`. | hot_semantic |
+| `koios refs <target>` | All references (read/write/call-classified) to a symbol. | relational |
+| `koios callers <target>` | Incoming call hierarchy (`--depth N`). | relational |
+| `koios impls <target>` | Source implementations / overrides / derived types. | relational |
+| `koios hierarchy <target>` | Base/interface and derived-type hierarchy (`--direction`). | relational |
+| `koios diagnostics [path]` | Compiler diagnostics for a file/project/solution (`--scope`, `--min-severity`). | relational |
 
-Every command emits the canonical response envelope (`--format json`) or a
-human-readable view (`--format text`, default). Symbols are keyed by their Roslyn
+A `<target>` is `file:line:col` or `--id <symbol_id>`. Every command emits the
+canonical response envelope (`--format json`) or a human-readable view
+(`--format text`, default). Symbols are keyed by their Roslyn
 `DocumentationCommentId` (surfaced as `symbol_id`), so an agent can pass an id back
 to re-target a symbol without re-resolving by position.
+
+Relational queries need the target's references resolved — i.e. a restored
+solution. On an unrestored project, symbols still extract but `diagnostics` flags
+the result `degraded` (it would otherwise report missing-reference errors as if
+they were real).
 
 ## Roadmap
 
@@ -35,13 +47,14 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   snapshot, and project an in-memory symbol catalog. Exposes `status`, `search`,
   `goto-definition`, `hover`, and `outline` (with the `hot` / `hot_semantic` split)
   through a CLI with JSON/text output and repo-local SDK auto-detection.
+- <a id="relational-queries"></a>**Relational queries** (done)
+  `refs`, `callers` (incoming call hierarchy), `impls`, `hierarchy`, and
+  `diagnostics` via Roslyn `SymbolFinder` / compiler diagnostics — the capability
+  that most decisively beats grep. (Outgoing callees and result memoization land
+  with the resident host, where they pay off.)
 - <a id="live-edits"></a>**Live edits**
   `FileSystemWatcher` with a debounced, incremental re-projection so edits are
   reflected within ~250 ms without a restart.
-- <a id="relational-queries"></a>**Relational queries**
-  `find-references`, `call-hierarchy`, `find-implementations`, `type-hierarchy`,
-  and `diagnostics` via Roslyn `SymbolFinder` / compiler diagnostics, memoized and
-  invalidated on edit. The capability that most decisively beats grep.
 - <a id="persistence--warm-start"></a>**Persistence & warm start**
   Write-through SQLite mirror of the catalog for instant warm-start and an offline
   CLI fallback.

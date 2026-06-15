@@ -52,9 +52,68 @@ public sealed class SymbolItem
     public Loc? Loc { get; init; }
     [JsonPropertyName("score")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public double? Score { get; init; }
+    [JsonPropertyName("relation")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Relation { get; init; }
     [JsonPropertyName("is_metadata")] public bool IsMetadata { get; init; }
     [JsonPropertyName("generated")] public bool Generated { get; init; }
     [JsonPropertyName("source")] public string Source { get; init; } = "semantic";
+}
+
+// A single reference (read/write/call) to a target symbol.
+public sealed class ReferenceItem
+{
+    [JsonPropertyName("kind")] public string Kind { get; init; } = "reference";
+    [JsonPropertyName("loc")] public Loc Loc { get; init; } = new();
+    [JsonPropertyName("source")] public string Source { get; init; } = "semantic";
+}
+
+// A node in the call hierarchy (a caller of, or callee of, the target).
+public sealed class CallNode
+{
+    [JsonPropertyName("symbol_id")] public string? SymbolId { get; init; }
+    [JsonPropertyName("name")] public string Name { get; init; } = "";
+    [JsonPropertyName("kind")] public string Kind { get; init; } = "";
+    [JsonPropertyName("container")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Container { get; init; }
+    [JsonPropertyName("call_sites")] public IReadOnlyList<Loc> CallSites { get; init; } = Array.Empty<Loc>();
+    [JsonPropertyName("depth")] public int Depth { get; init; }
+    [JsonPropertyName("source")] public string Source { get; init; } = "semantic";
+    [JsonPropertyName("children")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<CallNode>? Children { get; init; }
+}
+
+// A node in a type hierarchy (a base, interface, or derived type of the target).
+public sealed class HierarchyItem
+{
+    [JsonPropertyName("symbol_id")] public string? SymbolId { get; init; }
+    [JsonPropertyName("name")] public string Name { get; init; } = "";
+    [JsonPropertyName("kind")] public string Kind { get; init; } = "";
+    [JsonPropertyName("relation")] public string Relation { get; init; } = "";
+    [JsonPropertyName("depth")] public int Depth { get; init; }
+    [JsonPropertyName("loc")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Loc? Loc { get; init; }
+    [JsonPropertyName("is_metadata")] public bool IsMetadata { get; init; }
+    [JsonPropertyName("source")] public string Source { get; init; } = "semantic";
+}
+
+public sealed class DiagnosticItem
+{
+    [JsonPropertyName("id")] public string Id { get; init; } = "";
+    [JsonPropertyName("severity")] public string Severity { get; init; } = "";
+    [JsonPropertyName("message")] public string Message { get; init; } = "";
+    [JsonPropertyName("loc")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Loc? Loc { get; init; }
+    [JsonPropertyName("end")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public EndPos? End { get; init; }
+    [JsonPropertyName("category")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Category { get; init; }
+    [JsonPropertyName("source")] public string Source { get; init; } = "semantic";
+}
+
+public sealed class EndPos
+{
+    [JsonPropertyName("line")] public int Line { get; init; }
+    [JsonPropertyName("col")] public int Col { get; init; }
 }
 
 public sealed class HoverItem

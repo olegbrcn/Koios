@@ -1,7 +1,10 @@
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.FindSymbols;
 using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 
@@ -90,8 +93,23 @@ public sealed class Engine : IDisposable
             return;
         }
 
+        // Drop analyzer references. We never run analyzers for navigation, and an
+        // UnresolvedAnalyzerReference (common in MSBuildWorkspace loads) crashes
+        // SymbolFinder operations that compute project checksums. Compiler
+        // diagnostics from GetDiagnostics are unaffected.
+        solution = StripAnalyzerReferences(solution!);
+
         await ProjectCatalogAsync(ct);
         loadMs = sw.ElapsedMilliseconds;
+    }
+
+    private static Solution StripAnalyzerReferences(Solution s)
+    {
+        var none = Array.Empty<Microsoft.CodeAnalysis.Diagnostics.AnalyzerReference>();
+        foreach (var p in s.Projects.ToList())
+            if (p.AnalyzerReferences.Count > 0)
+                s = s.WithProjectAnalyzerReferences(p.Id, none);
+        return s;
     }
 
     private static string HumanizeLoadFailure(string message)
@@ -604,6 +622,361 @@ public sealed class Engine : IDisposable
         }
         catch { return p; }
     }
+
+    // ---- Relational queries (live SymbolFinder / diagnostics) --------------
+
+    /// <summary>Resolve a target (positional or by symbol_id) to a live ISymbol.</summary>
+    private async Task<ISymbol?> ResolveSymbolAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
+    {
+        if (!string.IsNullOrEmpty(symbolId))
+        {
+            foreach (var project in solution!.Projects)
+            {
+                if (project.Language != LanguageNames.CSharp) continue;
+                var comp = await project.GetCompilationAsync(ct);
+                if (comp is null) continue;
+                var sym = DocumentationCommentId.GetFirstSymbolForDeclarationId(symbolId!, comp);
+                if (sym is not null) return sym;
+            }
+            return null;
+        }
+        var (s, _) = await ResolvePositionalAsync(path, line, col, ct);
+        return s;
+    }
+
+    public async Task<Envelope<ReferenceItem>> FindReferencesAsync(
+        string? path, int? line, int? col, string? symbolId, bool includeDeclaration, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (symbol is null) return SymbolNotFound<ReferenceItem>();
+
+        var found = await SymbolFinder.FindReferencesAsync(symbol, solution!, ct);
+        var items = new List<ReferenceItem>();
+        foreach (var rs in found)
+        {
+            if (includeDeclaration)
+                foreach (var dl in rs.Definition.Locations)
+                    if (dl.IsInSource) items.Add(new ReferenceItem { Kind = "definition", Loc = LocFrom(dl) });
+            foreach (var refLoc in rs.Locations)
+            {
+                if (!refLoc.Location.IsInSource) continue;
+                var kind = await ClassifyReferenceAsync(refLoc, ct);
+                items.Add(new ReferenceItem { Kind = kind, Loc = LocFrom(refLoc.Location) });
+            }
+        }
+        items = items
+            .OrderBy(i => i.Loc.Path, StringComparer.Ordinal).ThenBy(i => i.Loc.Line).ThenBy(i => i.Loc.Col)
+            .ToList();
+        var total = items.Count;
+        var notes = new List<string>();
+        if (total > limit) { items = items.Take(limit).ToList(); notes.Add($"{total} references; showing {limit}"); }
+        return Relational(items, sw, notes);
+    }
+
+    // Best-effort read/write/call classification from syntax context (Roslyn's
+    // ReferenceLocation does not classify these).
+    private static async Task<string> ClassifyReferenceAsync(ReferenceLocation refLoc, CancellationToken ct)
+    {
+        var root = await refLoc.Document.GetSyntaxRootAsync(ct);
+        if (root is null) return "reference";
+        var span = refLoc.Location.SourceSpan;
+        var node = root.FindToken(span.Start).Parent;
+        for (var n = node; n is not null; n = n.Parent)
+        {
+            if (n is InvocationExpressionSyntax inv && inv.Expression.Span.Contains(span)) return "call";
+            if (n is ObjectCreationExpressionSyntax oc && oc.Type.Span.Contains(span)) return "call";
+            if (n is AssignmentExpressionSyntax asg && asg.Left.Span.Contains(span)) return "write";
+            if (n is ArgumentSyntax arg && !arg.RefKindKeyword.IsKind(SyntaxKind.None)) return "write";
+            if (n is StatementSyntax) break;
+        }
+        return "read";
+    }
+
+    public async Task<Envelope<SymbolItem>> FindImplementationsAsync(
+        string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (symbol is null) return SymbolNotFound<SymbolItem>();
+
+        var results = new List<(ISymbol Sym, string Relation)>();
+        if (symbol is INamedTypeSymbol type && type.TypeKind != TypeKind.Interface)
+        {
+            foreach (var s in await SymbolFinder.FindDerivedClassesAsync(type, solution!, transitive: true, null, ct))
+                results.Add((s, "derives"));
+        }
+        else
+        {
+            foreach (var s in await SymbolFinder.FindImplementationsAsync(symbol, solution!, null, ct))
+                results.Add((s, "implements"));
+            if (symbol is not INamedTypeSymbol)
+                foreach (var s in await SymbolFinder.FindOverridesAsync(symbol, solution!, null, ct))
+                    results.Add((s, "overrides"));
+        }
+
+        // Source implementers only — a metadata interface (e.g. IDisposable) has
+        // thousands of BCL implementers that are noise for code navigation.
+        var sourceResults = results.Where(r => r.Sym.Locations.Any(l => l.IsInSource)).ToList();
+        var metaOmitted = results.Count - sourceResults.Count;
+
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var items = new List<SymbolItem>();
+        foreach (var (s, rel) in sourceResults)
+        {
+            if (!seen.Add((s.GetDocumentationCommentId() ?? s.Name) + "|" + rel)) continue;
+            items.Add(SymbolItemFrom(s, rel));
+        }
+        items = items.OrderBy(i => i.Name, StringComparer.Ordinal).ToList();
+        var notes = new List<string>();
+        if (items.Count == 0) notes.Add("no implementations / derived types found in source");
+        if (metaOmitted > 0) notes.Add($"{metaOmitted} metadata implementer(s) omitted (source only)");
+        if (items.Count > limit) items = items.Take(limit).ToList();
+        return Relational(items, sw, notes);
+    }
+
+    public async Task<Envelope<HierarchyItem>> TypeHierarchyAsync(
+        string? path, int? line, int? col, string? symbolId, string direction, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (symbol is null) return SymbolNotFound<HierarchyItem>();
+        if (symbol is not INamedTypeSymbol type)
+            return InvalidArg<HierarchyItem>("select a type, not a member");
+
+        var items = new List<HierarchyItem>();
+        var wantBase = direction is "both" or "base";
+        var wantDerived = direction is "both" or "derived";
+        if (wantBase)
+        {
+            var d = 1;
+            for (var b = type.BaseType; b is not null && b.SpecialType != SpecialType.System_Object; b = b.BaseType)
+                items.Add(HierItem(b, "base", d++));
+            foreach (var i in type.AllInterfaces)
+                items.Add(HierItem(i, "interface", 1));
+        }
+        var notes = new List<string>();
+        if (wantDerived)
+        {
+            IEnumerable<INamedTypeSymbol> found = type.TypeKind == TypeKind.Interface
+                ? (await SymbolFinder.FindImplementationsAsync(type, solution!, null, ct)).OfType<INamedTypeSymbol>()
+                : await SymbolFinder.FindDerivedClassesAsync(type, solution!, transitive: true, null, ct);
+            var derived = found.ToList();
+            var source = derived.Where(d => d.Locations.Any(l => l.IsInSource)).ToList();
+            foreach (var dt in source) items.Add(HierItem(dt, "derived", 1));
+            if (derived.Count - source.Count > 0)
+                notes.Add($"{derived.Count - source.Count} metadata derived type(s) omitted (source only)");
+        }
+        if (items.Count > limit) items = items.Take(limit).ToList();
+        return Relational(items, sw, notes);
+    }
+
+    public async Task<Envelope<CallNode>> CallersAsync(
+        string? path, int? line, int? col, string? symbolId, int depth, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (symbol is null) return SymbolNotFound<CallNode>();
+
+        var visited = new HashSet<string>(StringComparer.Ordinal);
+        var nodes = await CollectCallersAsync(symbol, 1, Math.Max(1, depth), visited, ct);
+        var notes = nodes.Count == 0 ? new List<string> { "no callers found" } : new();
+        if (nodes.Count > limit) nodes = nodes.Take(limit).ToList();
+        return Relational(nodes, sw, notes);
+    }
+
+    private async Task<List<CallNode>> CollectCallersAsync(
+        ISymbol symbol, int depth, int maxDepth, HashSet<string> visited, CancellationToken ct)
+    {
+        var callers = await SymbolFinder.FindCallersAsync(symbol, solution!, ct);
+        var list = new List<CallNode>();
+        foreach (var c in callers)
+        {
+            if (!c.IsDirect) continue;
+            var calling = c.CallingSymbol;
+            var id = calling.GetDocumentationCommentId();
+            var sites = c.Locations.Where(l => l.IsInSource).Select(LocFrom).ToList();
+            List<CallNode>? children = null;
+            if (depth < maxDepth && id is not null && visited.Add(id))
+                children = await CollectCallersAsync(calling, depth + 1, maxDepth, visited, ct);
+            list.Add(new CallNode
+            {
+                SymbolId = id,
+                Name = calling.Name,
+                Kind = Display.KindOf(calling),
+                Container = calling.ContainingSymbol?.ToDisplayString(Display.Fqn),
+                CallSites = sites,
+                Depth = depth,
+                Children = children,
+            });
+        }
+        return list.OrderBy(n => n.Name, StringComparer.Ordinal).ToList();
+    }
+
+    public async Task<Envelope<DiagnosticItem>> DiagnosticsAsync(
+        string scope, string? path, string? projectName, string minSeverity, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var threshold = ParseSeverity(minSeverity);
+        var diags = new List<Diagnostic>();
+
+        if (scope == "file")
+        {
+            if (path is null) return InvalidArg<DiagnosticItem>("file scope requires a path");
+            var rel = NormalizeToRel(path);
+            var abs = Path.GetFullPath(Path.Combine(root, rel));
+            var docId = solution!.GetDocumentIdsWithFilePath(abs).FirstOrDefault();
+            if (docId is null) return InvalidArg<DiagnosticItem>($"no loaded document for '{rel}'");
+            var model = await solution.GetDocument(docId)!.GetSemanticModelAsync(ct);
+            if (model is null) return new Envelope<DiagnosticItem>
+            {
+                Ok = false, SnapshotId = SnapshotId,
+                Error = new ErrorInfo { Code = "requires_semantic", Message = "No semantic model for the file.", Retryable = true },
+            };
+            diags.AddRange(model.GetDiagnostics(null, ct));
+        }
+        else if (scope == "project")
+        {
+            var proj = solution!.Projects.FirstOrDefault(p => p.Name == projectName)
+                       ?? solution.Projects.FirstOrDefault(p => p.Language == LanguageNames.CSharp);
+            if (proj is null) return InvalidArg<DiagnosticItem>("no matching project");
+            var comp = await proj.GetCompilationAsync(ct);
+            if (comp is not null) diags.AddRange(comp.GetDiagnostics(ct));
+        }
+        else // solution
+        {
+            foreach (var p in solution!.Projects)
+            {
+                if (p.Language != LanguageNames.CSharp) continue;
+                var comp = await p.GetCompilationAsync(ct);
+                if (comp is not null) diags.AddRange(comp.GetDiagnostics(ct));
+            }
+        }
+
+        var matched = diags.Where(d => d.Severity >= threshold).ToList();
+        int errors = matched.Count(d => d.Severity == DiagnosticSeverity.Error);
+        int warnings = matched.Count(d => d.Severity == DiagnosticSeverity.Warning);
+        int infos = matched.Count(d => d.Severity == DiagnosticSeverity.Info);
+
+        // Missing-reference errors mean the compilation's references are incomplete
+        // (usually an unrestored project), not real code errors — flag rather than
+        // present them as ground truth.
+        int refErrs = matched.Count(d => ReferenceResolutionErrors.Contains(d.Id));
+
+        var items = matched
+            .Select(ToDiagnosticItem)
+            .OrderBy(i => i.Loc?.Path ?? "", StringComparer.Ordinal)
+            .ThenBy(i => i.Loc?.Line ?? 0)
+            .ToList();
+        var notes = new List<string> { $"errors: {errors}, warnings: {warnings}, info: {infos}" };
+        if (refErrs > 0)
+            notes.Add($"{refErrs} reference-resolution error(s) — the target looks unrestored; run a build/restore for reliable diagnostics");
+        if (items.Count > limit) { notes.Add($"{items.Count} diagnostics; showing {limit}"); items = items.Take(limit).ToList(); }
+        return Relational(items, sw, notes, degraded: refErrs > 0);
+    }
+
+    private static DiagnosticSeverity ParseSeverity(string s) => s.ToLowerInvariant() switch
+    {
+        "hidden" => DiagnosticSeverity.Hidden,
+        "info" => DiagnosticSeverity.Info,
+        "error" => DiagnosticSeverity.Error,
+        _ => DiagnosticSeverity.Warning,
+    };
+
+    private DiagnosticItem ToDiagnosticItem(Diagnostic d)
+    {
+        Loc? loc = null;
+        EndPos? end = null;
+        if (d.Location.IsInSource)
+        {
+            loc = LocFrom(d.Location);
+            var span = d.Location.GetLineSpan();
+            end = new EndPos { Line = span.EndLinePosition.Line + 1, Col = span.EndLinePosition.Character + 1 };
+        }
+        return new DiagnosticItem
+        {
+            Id = d.Id,
+            Severity = d.Severity.ToString().ToLowerInvariant(),
+            Message = d.GetMessage(),
+            Loc = loc,
+            End = end,
+            Category = d.Descriptor.Category,
+        };
+    }
+
+    // Missing-reference / unresolved-assembly compiler errors (see DiagnosticsAsync).
+    private static readonly HashSet<string> ReferenceResolutionErrors =
+        new(StringComparer.Ordinal) { "CS0006", "CS0009", "CS0012", "CS0234", "CS0246" };
+
+    private Envelope<T> Relational<T>(IReadOnlyList<T> items, Stopwatch sw, List<string> notes, bool degraded = false) => new()
+    {
+        Tier = "relational",
+        SnapshotId = SnapshotId,
+        Items = items,
+        ElapsedMs = sw.ElapsedMilliseconds,
+        Degraded = Degraded || degraded,
+        Notes = notes,
+    };
+
+    private SymbolItem SymbolItemFrom(ISymbol s, string? relation)
+    {
+        var src = s.Locations.FirstOrDefault(l => l.IsInSource);
+        return new SymbolItem
+        {
+            SymbolId = s.GetDocumentationCommentId(),
+            Name = s.Name,
+            Kind = Display.KindOf(s),
+            Container = s.ContainingSymbol?.ToDisplayString(Display.Fqn),
+            Accessibility = Display.AccessibilityOf(s),
+            Signature = Display.SignatureOf(s),
+            Loc = src is not null ? LocFrom(src) : null,
+            Relation = relation,
+            IsMetadata = src is null,
+            Source = "semantic",
+        };
+    }
+
+    private HierarchyItem HierItem(INamedTypeSymbol t, string relation, int depth)
+    {
+        var src = t.Locations.FirstOrDefault(l => l.IsInSource);
+        return new HierarchyItem
+        {
+            SymbolId = t.GetDocumentationCommentId(),
+            Name = t.Name,
+            Kind = Display.KindOf(t),
+            Relation = relation,
+            Depth = depth,
+            Loc = src is not null ? LocFrom(src) : null,
+            IsMetadata = src is null,
+            Source = "semantic",
+        };
+    }
+
+    private Loc LocFrom(Location loc)
+    {
+        var span = loc.GetLineSpan();
+        var line = span.StartLinePosition.Line;
+        var snippet = "";
+        if (loc.SourceTree is not null)
+        {
+            var text = loc.SourceTree.GetText();
+            if (line < text.Lines.Count) snippet = text.Lines[line].ToString().Trim();
+        }
+        return new Loc
+        {
+            Path = RelPath(loc.SourceTree?.FilePath),
+            Line = line + 1,
+            Col = span.StartLinePosition.Character + 1,
+            Snippet = snippet,
+        };
+    }
+
+    private Envelope<T> InvalidArg<T>(string message) => new()
+    {
+        Ok = false,
+        SnapshotId = SnapshotId,
+        Error = new ErrorInfo { Code = "invalid_argument", Message = message, Retryable = false },
+    };
 
     private Envelope<HoverItem> NotFoundHover() => new()
     {
