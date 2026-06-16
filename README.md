@@ -23,7 +23,7 @@ compiler diagnostics for cross-symbol queries, exposed through a CLI.
 | `koios hover <target>` | Signature, container, XML-doc summary (by name, `file:line:col`, or `--id`). | hot_semantic |
 | `koios refs <target>` | All references (read/write/call-classified) to a symbol. | relational |
 | `koios callers <target>` | Incoming call hierarchy (`--depth N`). | relational |
-| `koios impls <target>` | Source implementations / overrides / derived types. | relational |
+| `koios impls <target> [--of <TypeArg>]` | Source implementations / overrides / derived types. `--of` filters to a closed generic (e.g. `--of VehicleRawDataReceivedEventMessage`). | relational |
 | `koios hierarchy <target>` | Base/interface and derived-type hierarchy (`--direction`). | relational |
 | `koios diagnostics [path]` | Compiler diagnostics for a file/project/solution (`--scope`, `--min-severity`). | relational |
 
@@ -79,6 +79,7 @@ koios outline  src/Orders/OrderService.cs -s path/to/My.sln
 koios def      src/Orders/OrderService.cs:52:25 -s path/to/My.sln
 koios hover    --id "M:MyApp.Orders.OrderService.Submit(MyApp.Orders.Order)" -s path/to/My.sln --format json
 koios impls    IOrderHandler -s path/to/My.sln          # by bare name (unique match)
+koios impls    ICloudEventHandler --of VehicleRawDataReceivedEventMessage -s path/to/My.sln  # closed generic filter
 koios callers  Submit -s path/to/My.sln                 # ambiguous → lists candidate symbol_ids
 ```
 

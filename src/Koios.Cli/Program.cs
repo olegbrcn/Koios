@@ -94,6 +94,9 @@ sealed class CallersOptions : TargetOptions
 [Verb("impls", HelpText = "Implementations / overrides / derived types of the target.")]
 sealed class ImplsOptions : TargetOptions
 {
+    [Option("of", HelpText = "Filter to the closed generic where the first type argument matches this name (e.g. --of VehicleRawDataReceivedEventMessage).")]
+    public string? Of { get; set; }
+
     [Option("limit", Default = 100, HelpText = "Max results.")]
     public int Limit { get; set; }
 }
@@ -174,7 +177,7 @@ static class Cli
                 (ImplsOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
                 {
                     if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.FindImplementationsAsync(t.path, t.line, t.col, t.id, oo.Limit, default);
+                    var env = await engine.FindImplementationsAsync(t.path, t.line, t.col, t.id, oo.Of, oo.Limit, default);
                     return Emit(env, oo.Format, ImplsText);
                 }),
                 (HierarchyOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>

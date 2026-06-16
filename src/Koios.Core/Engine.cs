@@ -728,7 +728,7 @@ public sealed class Engine : IDisposable
     }
 
     public async Task<Envelope<SymbolItem>> FindImplementationsAsync(
-        string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
+        string? path, int? line, int? col, string? symbolId, string? ofTypeArg, int limit, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
         var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
@@ -756,6 +756,30 @@ public sealed class Engine : IDisposable
         var sourceResults = results.Where(r => r.Sym.Locations.Any(l => l.IsInSource)).ToList();
         var metaOmitted = results.Count - sourceResults.Count;
 
+        var notes = new List<string>();
+
+        // --of: keep only implementers of the closed generic IFace<ofTypeArg>.
+        // We match on the simple Name of the first type argument, comparing by
+        // DocumentationCommentId of the original definition so the filter is stable
+        // across projects that reference the same interface from different compilations.
+        if (!string.IsNullOrEmpty(ofTypeArg) && symbol is INamedTypeSymbol ifaceSymbol)
+        {
+            var ifaceId = ifaceSymbol.OriginalDefinition.GetDocumentationCommentId();
+            var beforeFilter = sourceResults.Count;
+            sourceResults = sourceResults
+                .Where(r =>
+                {
+                    if (r.Sym is not INamedTypeSymbol cls) return false;
+                    return cls.AllInterfaces.Any(iface =>
+                        iface.IsGenericType &&
+                        iface.OriginalDefinition.GetDocumentationCommentId() == ifaceId &&
+                        iface.TypeArguments.Length > 0 &&
+                        iface.TypeArguments[0].Name.Equals(ofTypeArg, StringComparison.OrdinalIgnoreCase));
+                })
+                .ToList();
+            notes.Add($"filtered to {ifaceSymbol.Name}<{ofTypeArg}>: {beforeFilter} → {sourceResults.Count}");
+        }
+
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var items = new List<SymbolItem>();
         foreach (var (s, rel) in sourceResults)
@@ -764,7 +788,6 @@ public sealed class Engine : IDisposable
             items.Add(SymbolItemFrom(s, rel));
         }
         items = items.OrderBy(i => i.Name, StringComparer.Ordinal).ToList();
-        var notes = new List<string>();
         if (items.Count == 0) notes.Add("no implementations / derived types found in source");
         if (metaOmitted > 0) notes.Add($"{metaOmitted} metadata implementer(s) omitted (source only)");
         if (items.Count > limit) items = items.Take(limit).ToList();

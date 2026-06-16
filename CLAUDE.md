@@ -25,8 +25,9 @@ built on Roslyn.
 
 Foundation & HOT-query tier and relational queries complete (see the README roadmap).
 CLI commands: `status`, `search`, `outline`, `def`, `hover` (hot); `refs`, `callers`,
-`impls`, `hierarchy`, `diagnostics` (relational, via `SymbolFinder` / compiler
-diagnostics). No watcher, SQLite, or MCP server yet.
+`impls` (with `--of <TypeArg>` for closed-generic filtering), `hierarchy`,
+`diagnostics` (relational, via `SymbolFinder` / compiler diagnostics). No watcher,
+SQLite, or MCP server yet.
 
 Target resolution (`def`/`hover`/`refs`/`callers`/`impls`/`hierarchy`):
 - A target is `file:line:col`, a `symbol_id` (doc-comment id), or a **bare name**.
@@ -45,6 +46,10 @@ Relational notes:
 - `impls`/`hierarchy` derived results are filtered to source symbols (a metadata
   interface like `IDisposable` has thousands of BCL implementers); omitted counts
   are surfaced in `notes`.
+- `impls --of <TypeArg>` post-filters to implementers of the closed generic
+  `IFace<TypeArg>`. Matching is done via `OriginalDefinition` doc-comment id (stable
+  across compilations) + first type argument `Name` (case-insensitive). A `notes`
+  line reports the narrowing (e.g. `"filtered to ICloudEventHandler<VehicleRawDataReceivedEventMessage>: 79 → 32"`).
 - `diagnostics` is only meaningful on a restored target; missing-reference errors
   (CS0006/0009/0012/0234/0246) flag the result `degraded` rather than presenting
   them as real.
