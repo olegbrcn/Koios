@@ -48,6 +48,15 @@ public sealed class Catalog
     public SymbolEntry? ByMoniker(string moniker) =>
         byMoniker.TryGetValue(moniker, out var e) ? e : null;
 
+    /// <summary>Entries whose simple name matches exactly. Prefers case-sensitive hits,
+    /// falling back to the case-insensitive bucket when none match exactly.</summary>
+    public IReadOnlyList<SymbolEntry> ByExactName(string name)
+    {
+        if (!byNameCi.TryGetValue(name, out var list)) return Array.Empty<SymbolEntry>();
+        var exact = list.Where(e => string.Equals(e.Name, name, StringComparison.Ordinal)).ToList();
+        return exact.Count > 0 ? exact : list;
+    }
+
     public IReadOnlyList<SymbolEntry> InFile(string relPath) =>
         byFile.TryGetValue(relPath, out var list) ? list : Array.Empty<SymbolEntry>();
 

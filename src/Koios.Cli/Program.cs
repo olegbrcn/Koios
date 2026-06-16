@@ -44,7 +44,7 @@ sealed class OutlineOptions : GlobalOptions
 [Verb("def", HelpText = "Go to definition.")]
 sealed class DefOptions : GlobalOptions
 {
-    [Value(0, MetaName = "target", HelpText = "file:line:col, or a symbol_id. Omit if using --id.")]
+    [Value(0, MetaName = "target", HelpText = "file:line:col, a symbol_id, or a symbol name. Omit if using --id.")]
     public string? Target { get; set; }
 
     [Option("id", HelpText = "Target a symbol by its symbol_id (DocumentationCommentId).")]
@@ -54,7 +54,7 @@ sealed class DefOptions : GlobalOptions
 [Verb("hover", HelpText = "Signature, container, and XML-doc summary.")]
 sealed class HoverOptions : GlobalOptions
 {
-    [Value(0, MetaName = "target", HelpText = "file:line:col, or a symbol_id. Omit if using --id.")]
+    [Value(0, MetaName = "target", HelpText = "file:line:col, a symbol_id, or a symbol name. Omit if using --id.")]
     public string? Target { get; set; }
 
     [Option("id", HelpText = "Target a symbol by its symbol_id (DocumentationCommentId).")]
@@ -64,7 +64,7 @@ sealed class HoverOptions : GlobalOptions
 // Shared target selector for relational commands.
 abstract class TargetOptions : GlobalOptions
 {
-    [Value(0, MetaName = "target", HelpText = "file:line:col, or a symbol_id. Omit if using --id.")]
+    [Value(0, MetaName = "target", HelpText = "file:line:col, a symbol_id, or a symbol name. Omit if using --id.")]
     public string? Target { get; set; }
 
     [Option("id", HelpText = "Target a symbol by its symbol_id (DocumentationCommentId).")]
@@ -280,7 +280,7 @@ static class Cli
                 t = (null, null, null, target); // a symbol_id (monikers carry a single ':')
             return true;
         }
-        Console.Error.WriteLine("error: provide a target as file:line:col or --id <symbol_id>.");
+        Console.Error.WriteLine("error: provide a target as file:line:col, a symbol name, or --id <symbol_id>.");
         t = default;
         return false;
     }

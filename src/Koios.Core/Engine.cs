@@ -456,7 +456,9 @@ public sealed class Engine : IDisposable
     {
         if (!string.IsNullOrEmpty(symbolId))
         {
-            var e = catalog.ByMoniker(symbolId!);
+            var (moniker, candidates) = NormalizeTargetId(symbolId!);
+            if (candidates is not null) return Ambiguous<SymbolItem>(candidates);
+            var e = catalog.ByMoniker(moniker ?? symbolId!);
             if (e is null)
                 return SymbolNotFound<SymbolItem>();
             return new Envelope<SymbolItem>
@@ -487,7 +489,11 @@ public sealed class Engine : IDisposable
     public async Task<Envelope<HoverItem>> HoverAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
     {
         if (!string.IsNullOrEmpty(symbolId))
-            return HoverById(symbolId!);
+        {
+            var (moniker, candidates) = NormalizeTargetId(symbolId!);
+            if (candidates is not null) return Ambiguous<HoverItem>(candidates);
+            return HoverById(moniker ?? symbolId!);
+        }
 
         var (sym, _) = await ResolvePositionalAsync(path, line, col, ct);
         if (sym is null)
@@ -625,30 +631,58 @@ public sealed class Engine : IDisposable
 
     // ---- Relational queries (live SymbolFinder / diagnostics) --------------
 
-    /// <summary>Resolve a target (positional or by symbol_id) to a live ISymbol.</summary>
-    private async Task<ISymbol?> ResolveSymbolAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
+    /// <summary>Outcome of resolving a target: a live symbol, or — when a bare name
+    /// matched more than one declaration — the ambiguous candidates to report back.</summary>
+    private readonly record struct Resolved(ISymbol? Symbol, IReadOnlyList<SymbolEntry>? Ambiguous);
+
+    /// <summary>
+    /// Map a target string (the symbol_id slot) to a concrete moniker. A known catalog
+    /// moniker or a doc-comment id (e.g. "T:…", "M:…") passes through unchanged; anything
+    /// else is treated as a bare name and resolved against the catalog.
+    /// Exactly one of the returned fields is meaningful: a non-null moniker is a unique
+    /// resolution; a non-null candidates list means the name was ambiguous. (null, null)
+    /// means the name matched nothing.
+    /// </summary>
+    private (string? Moniker, IReadOnlyList<SymbolEntry>? Candidates) NormalizeTargetId(string raw)
+    {
+        if (catalog.ByMoniker(raw) is not null) return (raw, null);
+        if (raw.Length > 1 && raw[1] == ':') return (raw, null); // doc-comment id shape
+
+        var matches = catalog.ByExactName(raw);
+        if (matches.Count == 1) return (matches[0].Moniker, null);
+        if (matches.Count == 0) return (null, null);
+        return (null, matches);
+    }
+
+    /// <summary>Resolve a target (positional, symbol_id, or bare name) to a live ISymbol.</summary>
+    private async Task<Resolved> ResolveSymbolAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
     {
         if (!string.IsNullOrEmpty(symbolId))
         {
+            var (moniker, candidates) = NormalizeTargetId(symbolId!);
+            if (candidates is not null) return new Resolved(null, candidates);
+            var id = moniker ?? symbolId!;
             foreach (var project in solution!.Projects)
             {
                 if (project.Language != LanguageNames.CSharp) continue;
                 var comp = await project.GetCompilationAsync(ct);
                 if (comp is null) continue;
-                var sym = DocumentationCommentId.GetFirstSymbolForDeclarationId(symbolId!, comp);
-                if (sym is not null) return sym;
+                var sym = DocumentationCommentId.GetFirstSymbolForDeclarationId(id, comp);
+                if (sym is not null) return new Resolved(sym, null);
             }
-            return null;
+            return new Resolved(null, null);
         }
         var (s, _) = await ResolvePositionalAsync(path, line, col, ct);
-        return s;
+        return new Resolved(s, null);
     }
 
     public async Task<Envelope<ReferenceItem>> FindReferencesAsync(
         string? path, int? line, int? col, string? symbolId, bool includeDeclaration, int limit, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<ReferenceItem>(amb);
+        var symbol = res.Symbol;
         if (symbol is null) return SymbolNotFound<ReferenceItem>();
 
         var found = await SymbolFinder.FindReferencesAsync(symbol, solution!, ct);
@@ -697,7 +731,9 @@ public sealed class Engine : IDisposable
         string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(amb);
+        var symbol = res.Symbol;
         if (symbol is null) return SymbolNotFound<SymbolItem>();
 
         var results = new List<(ISymbol Sym, string Relation)>();
@@ -739,7 +775,9 @@ public sealed class Engine : IDisposable
         string? path, int? line, int? col, string? symbolId, string direction, int limit, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<HierarchyItem>(amb);
+        var symbol = res.Symbol;
         if (symbol is null) return SymbolNotFound<HierarchyItem>();
         if (symbol is not INamedTypeSymbol type)
             return InvalidArg<HierarchyItem>("select a type, not a member");
@@ -775,7 +813,9 @@ public sealed class Engine : IDisposable
         string? path, int? line, int? col, string? symbolId, int depth, int limit, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
-        var symbol = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<CallNode>(amb);
+        var symbol = res.Symbol;
         if (symbol is null) return SymbolNotFound<CallNode>();
 
         var visited = new HashSet<string>(StringComparer.Ordinal);
@@ -977,6 +1017,31 @@ public sealed class Engine : IDisposable
         SnapshotId = SnapshotId,
         Error = new ErrorInfo { Code = "invalid_argument", Message = message, Retryable = false },
     };
+
+    // A bare name matched more than one declaration. Report the candidates (with their
+    // symbol_ids) so the caller can re-run precisely via --id or file:line:col.
+    private Envelope<T> Ambiguous<T>(IReadOnlyList<SymbolEntry> cands)
+    {
+        const int Max = 25;
+        var shown = cands
+            .OrderBy(c => c.Fqn, StringComparer.Ordinal)
+            .Take(Max)
+            .Select(c =>
+            {
+                var loc = c.Primary is { } p ? $"  {p.RelPath}:{p.Line}:{p.Col}" : "";
+                return $"{c.Kind} {c.Fqn}  [{c.Moniker}]{loc}";
+            });
+        var more = cands.Count > Max ? $"\n  … {cands.Count - Max} more" : "";
+        var msg = $"'{cands[0].Name}' is ambiguous — {cands.Count} matches. "
+                + "Re-run with --id <symbol_id> or file:line:col:\n  "
+                + string.Join("\n  ", shown) + more;
+        return new Envelope<T>
+        {
+            Ok = false,
+            SnapshotId = SnapshotId,
+            Error = new ErrorInfo { Code = "ambiguous_symbol", Message = msg, Retryable = false },
+        };
+    }
 
     private Envelope<HoverItem> NotFoundHover() => new()
     {

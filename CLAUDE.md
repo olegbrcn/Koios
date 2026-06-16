@@ -28,6 +28,16 @@ CLI commands: `status`, `search`, `outline`, `def`, `hover` (hot); `refs`, `call
 `impls`, `hierarchy`, `diagnostics` (relational, via `SymbolFinder` / compiler
 diagnostics). No watcher, SQLite, or MCP server yet.
 
+Target resolution (`def`/`hover`/`refs`/`callers`/`impls`/`hierarchy`):
+- A target is `file:line:col`, a `symbol_id` (doc-comment id), or a **bare name**.
+  `NormalizeTargetId` (Engine) passes through known monikers and doc-id-shaped strings
+  (`X:…`), else resolves the name via `Catalog.ByExactName` (case-sensitive preferred).
+- Unique name → resolved; >1 match → `ambiguous_symbol` error via `Ambiguous<T>`,
+  listing every candidate's `symbol_id` + loc so the caller re-runs with `--id`. Never
+  silently pick a top-ranked match for relational verbs.
+- `ResolveSymbolAsync` returns `Resolved(Symbol, Ambiguous)`; the CLI routes bare names
+  into the `--id`/symbol_id slot, so no CLI parsing change was needed.
+
 Relational notes:
 - `LoadAsync` strips analyzer references after open — an `UnresolvedAnalyzerReference`
   crashes `SymbolFinder` operations that compute project checksums. We never run
