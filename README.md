@@ -24,6 +24,7 @@ compiler diagnostics for cross-symbol queries, exposed through a CLI.
 | `koios refs <target>` | All references (read/write/call-classified) to a symbol. | relational |
 | `koios callers <target>` | Incoming call hierarchy (`--depth N`). | relational |
 | `koios impls <target> [--of <TypeArg>]` | Source implementations / overrides / derived types. `--of` filters to a closed generic (e.g. `--of VehicleRawDataReceivedEventMessage`). | relational |
+| `koios injectors <target>` | Classes that declare the target type as a constructor parameter (DI injection sites). | relational |
 | `koios hierarchy <target>` | Base/interface and derived-type hierarchy (`--direction`). | relational |
 | `koios diagnostics [path]` | Compiler diagnostics for a file/project/solution (`--scope`, `--min-severity`). | relational |
 

@@ -25,9 +25,9 @@ built on Roslyn.
 
 Foundation & HOT-query tier and relational queries complete (see the README roadmap).
 CLI commands: `status`, `search`, `outline`, `def`, `hover` (hot); `refs`, `callers`,
-`impls` (with `--of <TypeArg>` for closed-generic filtering), `hierarchy`,
-`diagnostics` (relational, via `SymbolFinder` / compiler diagnostics). No watcher,
-SQLite, or MCP server yet.
+`impls` (with `--of <TypeArg>` for closed-generic filtering), `injectors`,
+`hierarchy`, `diagnostics` (relational, via `SymbolFinder` / compiler diagnostics).
+No watcher, SQLite, or MCP server yet.
 
 Target resolution (`def`/`hover`/`refs`/`callers`/`impls`/`hierarchy`):
 - A target is `file:line:col`, a `symbol_id` (doc-comment id), or a **bare name**.
@@ -50,6 +50,10 @@ Relational notes:
   `IFace<TypeArg>`. Matching is done via `OriginalDefinition` doc-comment id (stable
   across compilations) + first type argument `Name` (case-insensitive). A `notes`
   line reports the narrowing (e.g. `"filtered to ICloudEventHandler<VehicleRawDataReceivedEventMessage>: 79 → 32"`).
+- `injectors` resolves a type, runs `FindReferencesAsync`, and keeps references whose
+  syntax context is a constructor parameter's *type* (`ConstructorParameterContext`
+  walks up to a `ConstructorDeclarationSyntax`, ignoring default values/attributes).
+  The constructor's containing class is the injector; source-only, deduped by doc id.
 - `diagnostics` is only meaningful on a restored target; missing-reference errors
   (CS0006/0009/0012/0234/0246) flag the result `degraded` rather than presenting
   them as real.

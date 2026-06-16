@@ -794,6 +794,63 @@ public sealed class Engine : IDisposable
         return Relational(items, sw, notes);
     }
 
+    public async Task<Envelope<SymbolItem>> FindInjectorsAsync(
+        string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(amb);
+        var symbol = res.Symbol;
+        if (symbol is null) return SymbolNotFound<SymbolItem>();
+        if (symbol is not INamedTypeSymbol)
+            return InvalidArg<SymbolItem>("select a type (the dependency being injected)");
+
+        // A reference to the type that sits inside a constructor parameter's type is an
+        // injection site; the constructor's containing class is the injector.
+        var found = await SymbolFinder.FindReferencesAsync(symbol, solution!, ct);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        var items = new List<SymbolItem>();
+        foreach (var rs in found)
+        {
+            foreach (var refLoc in rs.Locations)
+            {
+                if (!refLoc.Location.IsInSource) continue;
+                var root = await refLoc.Document.GetSyntaxRootAsync(ct);
+                var node = root?.FindToken(refLoc.Location.SourceSpan.Start).Parent;
+                var (param, ctor) = ConstructorParameterContext(node, refLoc.Location.SourceSpan);
+                if (param is null || ctor is null) continue;
+
+                var model = await refLoc.Document.GetSemanticModelAsync(ct);
+                if (model?.GetDeclaredSymbol(ctor, ct)?.ContainingType is not { } cls) continue;
+                if (!cls.Locations.Any(l => l.IsInSource)) continue;
+                if (!seen.Add(cls.GetDocumentationCommentId() ?? cls.Name)) continue;
+                items.Add(SymbolItemFrom(cls, "injects"));
+            }
+        }
+        items = items.OrderBy(i => i.Name, StringComparer.Ordinal).ToList();
+        var notes = new List<string>();
+        if (items.Count == 0) notes.Add("no constructor-injection sites found in source");
+        if (items.Count > limit) items = items.Take(limit).ToList();
+        return Relational(items, sw, notes);
+    }
+
+    // Walk up from a type reference: return the enclosing constructor parameter and
+    // constructor declaration, but only when the reference is part of the parameter's
+    // declared type (not its default value or an attribute).
+    private static (ParameterSyntax? Param, ConstructorDeclarationSyntax? Ctor) ConstructorParameterContext(
+        SyntaxNode? node, Microsoft.CodeAnalysis.Text.TextSpan span)
+    {
+        ParameterSyntax? param = null;
+        for (var n = node; n is not null; n = n.Parent)
+        {
+            if (n is ParameterSyntax p && p.Type is not null && p.Type.Span.Contains(span)) param = p;
+            if (n is ConstructorDeclarationSyntax ctor)
+                return param is not null ? (param, ctor) : (null, null);
+            if (n is MemberDeclarationSyntax) break; // a different member — not a ctor param
+        }
+        return (null, null);
+    }
+
     public async Task<Envelope<HierarchyItem>> TypeHierarchyAsync(
         string? path, int? line, int? col, string? symbolId, string direction, int limit, CancellationToken ct)
     {

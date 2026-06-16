@@ -101,6 +101,13 @@ sealed class ImplsOptions : TargetOptions
     public int Limit { get; set; }
 }
 
+[Verb("injectors", HelpText = "Classes that declare the target type as a constructor parameter (DI injection sites).")]
+sealed class InjectorsOptions : TargetOptions
+{
+    [Option("limit", Default = 100, HelpText = "Max results.")]
+    public int Limit { get; set; }
+}
+
 [Verb("hierarchy", HelpText = "Base/interface and derived-type hierarchy of a type.")]
 sealed class HierarchyOptions : TargetOptions
 {
@@ -137,7 +144,7 @@ static class Cli
     public static Task<int> RunAsync(string[] args) =>
         Parser.Default
             .ParseArguments<StatusOptions, SearchOptions, OutlineOptions, DefOptions, HoverOptions,
-                            RefsOptions, CallersOptions, ImplsOptions, HierarchyOptions, DiagnosticsOptions>(args)
+                            RefsOptions, CallersOptions, ImplsOptions, InjectorsOptions, HierarchyOptions, DiagnosticsOptions>(args)
             .MapResult(
                 (StatusOptions o) => WithEngine(o, allowLoadFailure: true,
                     (engine, _) => Task.FromResult(Emit(engine.Status(), o.Format, StatusText))),
@@ -179,6 +186,12 @@ static class Cli
                     if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
                     var env = await engine.FindImplementationsAsync(t.path, t.line, t.col, t.id, oo.Of, oo.Limit, default);
                     return Emit(env, oo.Format, ImplsText);
+                }),
+                (InjectorsOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
+                {
+                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
+                    var env = await engine.FindInjectorsAsync(t.path, t.line, t.col, t.id, oo.Limit, default);
+                    return Emit(env, oo.Format, InjectorsText);
                 }),
                 (HierarchyOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
                 {
@@ -399,6 +412,18 @@ static class Cli
             Console.WriteLine($"{it.Relation,-11} {it.Kind,-10} {it.Name,-32} {loc}");
         }
         PrintFooter(env, env.Items.Count, "result(s)");
+    }
+
+    static void InjectorsText(Envelope<SymbolItem> env)
+    {
+        if (!env.Ok) { Error(env); return; }
+        if (env.Items.Count == 0) Console.WriteLine("(none)");
+        foreach (var it in env.Items)
+        {
+            var loc = it.Loc is null ? "" : $"{it.Loc.Path}:{it.Loc.Line}";
+            Console.WriteLine($"{it.Relation,-11} {it.Kind,-10} {it.Name,-32} {loc}");
+        }
+        PrintFooter(env, env.Items.Count, "injector(s)");
     }
 
     static void HierarchyText(Envelope<HierarchyItem> env)
