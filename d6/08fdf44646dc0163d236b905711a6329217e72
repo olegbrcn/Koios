@@ -1,0 +1,33 @@
+README.md
+  s_12fd903f846c8e::t_df5b0f42b9f1e3 49-66
+  s_12fd903f846c8e::t_82b2e2d1b158bc 12-17
+  s_12fd903f846c8e::t_cf81176bac6c34 81-85
+  s_12fd903f846c8e::t_ba20d3a3ab8462 114
+  s_12fd903f846c8e::t_e2e7d17401f4f7 21-23
+  s_12fd903f846c8e::t_78f355b5b54008 104-105
+CLAUDE.md
+  s_12fd903f846c8e::t_9318b399c05dee 18-27
+  s_12fd903f846c8e::t_2ca62781a5ed3c 35-37,42-53
+src/Koios.Cli/Program.cs
+  s_12fd903f846c8e::t_c50a7e4add1c45 212-214,216,220,232,236-237,246-253
+  s_12fd903f846c8e::t_d13dc7bdfcd436 164-173,178,180,182,184,186,189-198
+  s_12fd903f846c8e::t_b8aad395bb9ba2 159,162,174-177,179,181,183,185,187
+src/Koios.Core/Protocol.cs
+  s_12fd903f846c8e::t_0e72b4c7ad8f1d 17-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "d608fdf44646dc0163d236b905711a6329217e72",
+  "prompts": {},
+  "sessions": {
+    "s_12fd903f846c8e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "196062e3-1e24-4cfb-9903-9b19b5d0f0eb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "OlegBrcn <oleg@brcn.io>"
+    }
+  }
+}
