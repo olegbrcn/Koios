@@ -1,0 +1,34 @@
+src/Koios.Core/SocketClient.cs
+  s_12fd903f846c8e::t_e2659050e3b763 1-46
+src/Koios.Core/Protocol.cs
+  s_12fd903f846c8e::t_16744181b997e6 1-69
+src/Koios.Core/Engine.cs
+  s_12fd903f846c8e::t_81688b0869b746 331,359
+src/Koios.Core/RuntimeDir.cs
+  s_12fd903f846c8e::t_77b74e499051a0 1-27
+src/Koios.Core/Server.cs
+  s_12fd903f846c8e::t_6b9414f50a0235 1-153
+src/Koios.Cli/Program.cs
+  s_12fd903f846c8e::t_45b5396f850ca5 156,159-161
+  s_12fd903f846c8e::t_df9e1b39ae1c6f 24-33
+  s_12fd903f846c8e::t_a91d20a7369003 435,444-445
+  s_12fd903f846c8e::t_9ca7d422c95266 293-399
+src/Koios.Core/Models.cs
+  s_12fd903f846c8e::t_175a635eebd457 166-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.11",
+  "base_commit_sha": "d4a98684d9c501c3caeb4a9f8b2809daa5b66b40",
+  "prompts": {},
+  "sessions": {
+    "s_12fd903f846c8e": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "196062e3-1e24-4cfb-9903-9b19b5d0f0eb",
+        "model": "claude-opus-4-8"
+      },
+      "human_author": "OlegBrcn <oleg@brcn.io>"
+    }
+  }
+}
