@@ -818,11 +818,11 @@ public sealed class Engine : IDisposable
                 if (!refLoc.Location.IsInSource) continue;
                 var root = await refLoc.Document.GetSyntaxRootAsync(ct);
                 var node = root?.FindToken(refLoc.Location.SourceSpan.Start).Parent;
-                var (param, ctor) = ConstructorParameterContext(node, refLoc.Location.SourceSpan);
-                if (param is null || ctor is null) continue;
+                var injectorType = ConstructorInjectorType(node, refLoc.Location.SourceSpan);
+                if (injectorType is null) continue;
 
                 var model = await refLoc.Document.GetSemanticModelAsync(ct);
-                if (model?.GetDeclaredSymbol(ctor, ct)?.ContainingType is not { } cls) continue;
+                if (model?.GetDeclaredSymbol(injectorType, ct) is not INamedTypeSymbol cls) continue;
                 if (!cls.Locations.Any(l => l.IsInSource)) continue;
                 if (!seen.Add(cls.GetDocumentationCommentId() ?? cls.Name)) continue;
                 items.Add(SymbolItemFrom(cls, "injects"));
@@ -835,21 +835,27 @@ public sealed class Engine : IDisposable
         return Relational(items, sw, notes);
     }
 
-    // Walk up from a type reference: return the enclosing constructor parameter and
-    // constructor declaration, but only when the reference is part of the parameter's
-    // declared type (not its default value or an attribute).
-    private static (ParameterSyntax? Param, ConstructorDeclarationSyntax? Ctor) ConstructorParameterContext(
+    // Walk up from a type reference to the class that injects it. The reference must be
+    // part of a constructor parameter's declared *type* (not its default value or an
+    // attribute), in either a classic constructor or a primary constructor (whose
+    // parameters hang off the type declaration itself).
+    private static TypeDeclarationSyntax? ConstructorInjectorType(
         SyntaxNode? node, Microsoft.CodeAnalysis.Text.TextSpan span)
     {
         ParameterSyntax? param = null;
         for (var n = node; n is not null; n = n.Parent)
         {
-            if (n is ParameterSyntax p && p.Type is not null && p.Type.Span.Contains(span)) param = p;
-            if (n is ConstructorDeclarationSyntax ctor)
-                return param is not null ? (param, ctor) : (null, null);
-            if (n is MemberDeclarationSyntax) break; // a different member — not a ctor param
+            if (n is ParameterSyntax p && p.Type is not null && p.Type.Span.Contains(span))
+                param = p;
+            else if (n is ConstructorDeclarationSyntax ctor)
+                return param is not null ? ctor.Parent as TypeDeclarationSyntax : null;
+            else if (n is TypeDeclarationSyntax type) // primary-constructor parameters
+                return param is not null && type.ParameterList?.Span.Contains(param.Span) == true
+                    ? type : null;
+            else if (n is MemberDeclarationSyntax)
+                return null; // a different member (method/property/field) — not a ctor param
         }
-        return (null, null);
+        return null;
     }
 
     public async Task<Envelope<HierarchyItem>> TypeHierarchyAsync(

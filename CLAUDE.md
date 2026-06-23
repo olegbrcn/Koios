@@ -74,9 +74,10 @@ Relational notes:
   across compilations) + first type argument `Name` (case-insensitive). A `notes`
   line reports the narrowing (e.g. `"filtered to ICloudEventHandler<VehicleRawDataReceivedEventMessage>: 79 → 32"`).
 - `injectors` resolves a type, runs `FindReferencesAsync`, and keeps references whose
-  syntax context is a constructor parameter's *type* (`ConstructorParameterContext`
-  walks up to a `ConstructorDeclarationSyntax`, ignoring default values/attributes).
-  The constructor's containing class is the injector; source-only, deduped by doc id.
+  syntax context is a constructor parameter's *type* (`ConstructorInjectorType` walks up
+  to the injecting `TypeDeclarationSyntax`, ignoring default values/attributes). Handles
+  **both** classic constructors (`ConstructorDeclarationSyntax`) and **primary
+  constructors** (parameter list on the type declaration). Source-only, deduped by doc id.
 - `diagnostics` is only meaningful on a restored target; missing-reference errors
   (CS0006/0009/0012/0234/0246) flag the result `degraded` rather than presenting
   them as real.
