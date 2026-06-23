@@ -328,7 +328,7 @@ public sealed class Engine : IDisposable
     /// build tasks); C# navigation still works for what loaded, but completeness is reduced.</summary>
     private bool Degraded => projectsFailed > 0 || loadErrors.Count > 0;
 
-    public Envelope<StatusInfo> Status()
+    public Envelope<StatusInfo> Status(ResidentInfo? resident = null)
     {
         var state = solution is null || projectsLoaded == 0 ? "error" : "ready";
         return new Envelope<StatusInfo>
@@ -356,6 +356,7 @@ public sealed class Engine : IDisposable
                     Symbols = catalog.Count,
                     LoadErrors = loadErrors.ToArray(),
                     LoadMs = loadMs,
+                    Resident = resident,
                 }
             },
         };

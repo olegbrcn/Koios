@@ -163,6 +163,17 @@ public sealed class StatusInfo
     [JsonPropertyName("symbols")] public int Symbols { get; init; }
     [JsonPropertyName("load_errors")] public IReadOnlyList<string> LoadErrors { get; init; } = Array.Empty<string>();
     [JsonPropertyName("load_ms")] public long LoadMs { get; init; }
+    [JsonPropertyName("resident")] [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public ResidentInfo? Resident { get; init; }
+}
+
+// Present only when the status is answered by a resident server.
+public sealed class ResidentInfo
+{
+    [JsonPropertyName("pid")] public int Pid { get; init; }
+    [JsonPropertyName("socket_path")] public string SocketPath { get; init; } = "";
+    [JsonPropertyName("uptime_seconds")] public long UptimeSeconds { get; init; }
+    [JsonPropertyName("requests_served")] public int RequestsServed { get; init; }
 }
 
 public sealed class SolutionInfo

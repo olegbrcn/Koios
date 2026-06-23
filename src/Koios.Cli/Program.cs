@@ -21,6 +21,16 @@ abstract class GlobalOptions
 [Verb("status", HelpText = "Load the solution and report health.")]
 sealed class StatusOptions : GlobalOptions { }
 
+[Verb("serve", HelpText = "Load the solution once and stay resident, serving queries over a local socket (foreground; Ctrl+C to stop). Serves a fixed snapshot — restart to pick up on-disk edits.")]
+sealed class ServeOptions : GlobalOptions
+{
+    [Option("idle-timeout", Default = 15, HelpText = "Minutes of inactivity before the resident self-shuts down.")]
+    public int IdleTimeout { get; set; }
+}
+
+[Verb("stop", HelpText = "Stop the resident server for the solution.")]
+sealed class StopOptions : GlobalOptions { }
+
 [Verb("search", HelpText = "Ranked fuzzy symbol search.")]
 sealed class SearchOptions : GlobalOptions
 {
@@ -143,11 +153,12 @@ static class Cli
 
     public static Task<int> RunAsync(string[] args) =>
         Parser.Default
-            .ParseArguments<StatusOptions, SearchOptions, OutlineOptions, DefOptions, HoverOptions,
+            .ParseArguments<StatusOptions, ServeOptions, StopOptions, SearchOptions, OutlineOptions, DefOptions, HoverOptions,
                             RefsOptions, CallersOptions, ImplsOptions, InjectorsOptions, HierarchyOptions, DiagnosticsOptions>(args)
             .MapResult(
-                (StatusOptions o) => WithEngine(o, allowLoadFailure: true,
-                    (engine, _) => Task.FromResult(Emit(engine.Status(), o.Format, StatusText))),
+                (StatusOptions o) => StatusAsync(o),
+                (ServeOptions o) => ServeAsync(o),
+                (StopOptions o) => StopAsync(o),
                 (SearchOptions o) => WithEngine(o, allowLoadFailure: false, (engine, oo) =>
                 {
                     var kinds = string.IsNullOrWhiteSpace(oo.Kinds)
@@ -279,6 +290,113 @@ static class Cli
         }
     }
 
+    static string ResolveSolution(GlobalOptions o) =>
+        o.Solution ?? Environment.GetEnvironmentVariable("KOIOS_SOLUTION") ?? Directory.GetCurrentDirectory();
+
+    // status routes to the resident; without one it fails with an actionable error
+    // (queries never cold-load — the only cold load is `serve`).
+    static async Task<int> StatusAsync(StatusOptions o)
+    {
+        var solution = ResolveSolution(o);
+        var sock = RuntimeDir.SocketPathFor(solution);
+        if (!SocketClient.IsRunning(sock))
+        {
+            var env = new Envelope<StatusInfo>
+            {
+                Ok = false,
+                State = "error",
+                Error = new ErrorInfo
+                {
+                    Code = "no_resident",
+                    Message = $"no resident server for '{solution}'",
+                    Hint = $"start one with: koios serve -s '{solution}'",
+                    Retryable = false,
+                },
+            };
+            return Emit(env, o.Format, StatusText);
+        }
+        try
+        {
+            var env = await SocketClient.QueryAsync<StatusInfo>(sock, new Request { Verb = "status" }, default);
+            return Emit(env, o.Format, StatusText);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: {ex.Message}");
+            return 4;
+        }
+    }
+
+    static async Task<int> ServeAsync(ServeOptions o)
+    {
+        var solution = ResolveSolution(o);
+        var sock = RuntimeDir.SocketPathFor(solution);
+        if (SocketClient.IsRunning(sock))
+        {
+            Console.Error.WriteLine($"error: a resident server is already running for '{solution}' (socket: {sock}).");
+            Console.Error.WriteLine($"  stop it with: koios stop -s '{solution}'");
+            return 1;
+        }
+
+        RepoSdk.Configure(solution);
+        MSBuildBootstrap.Register();
+
+        var engine = new Engine();
+        try
+        {
+            await engine.LoadAsync(solution);
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: failed to load '{solution}': {ex.Message}");
+            engine.Dispose();
+            return 2;
+        }
+        if (engine.LoadFailed)
+        {
+            Console.Error.WriteLine($"error: solution not loaded: {engine.FatalLoadError ?? "unknown error"}");
+            engine.Dispose();
+            return 3;
+        }
+
+        var s = engine.Status().Items[0];
+        Console.Error.WriteLine($"loaded {s.Projects.Loaded}/{s.Projects.Total} projects, {s.Documents} documents, {s.Symbols} symbols in {s.LoadMs} ms");
+        Console.Error.WriteLine($"serving {sock} (idle timeout {o.IdleTimeout} min) — Ctrl+C to stop");
+
+        using var server = new Server(engine, sock, TimeSpan.FromMinutes(o.IdleTimeout));
+        server.Start();
+
+        var done = new TaskCompletionSource();
+        using var reg = server.ShutdownToken.Register(() => done.TrySetResult());
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; server.Stop(); };
+        await done.Task;
+        Console.Error.WriteLine("stopped.");
+        return 0;
+    }
+
+    static async Task<int> StopAsync(StopOptions o)
+    {
+        var solution = ResolveSolution(o);
+        var sock = RuntimeDir.SocketPathFor(solution);
+        if (!SocketClient.IsRunning(sock))
+        {
+            Console.Error.WriteLine($"no resident server running for '{solution}'.");
+            if (File.Exists(sock)) { try { File.Delete(sock); } catch { /* best-effort stale cleanup */ } }
+            return 1;
+        }
+        try
+        {
+            await SocketClient.ShutdownAsync(sock, default);
+            Console.Error.WriteLine($"stopped resident server for '{solution}'.");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"error: {ex.Message}");
+            return 4;
+        }
+    }
+
     // A target is either `file:line:col` or a symbol_id (via positional or --id).
     static bool TryTarget(string? target, string? id, out (string? path, int? line, int? col, string? id) t)
     {
@@ -314,6 +432,7 @@ static class Cli
 
     static void StatusText(Envelope<StatusInfo> env)
     {
+        if (!env.Ok) { Error(env); return; }
         var s = env.Items[0];
         Console.WriteLine($"state:      {s.State}{(env.Degraded ? " (degraded)" : "")}");
         Console.WriteLine($"solution:   {s.Solution.File}  [{s.Solution.Root}]");
@@ -322,6 +441,8 @@ static class Cli
         Console.WriteLine($"documents:  {s.Documents}");
         Console.WriteLine($"symbols:    {s.Symbols}");
         Console.WriteLine($"load time:  {s.LoadMs} ms");
+        if (s.Resident is { } r)
+            Console.WriteLine($"resident:   pid {r.Pid}, uptime {r.UptimeSeconds}s, {r.RequestsServed} request(s)  [{r.SocketPath}]");
         if (s.LoadErrors.Count > 0)
         {
             Console.WriteLine($"load errors ({s.LoadErrors.Count}):");
