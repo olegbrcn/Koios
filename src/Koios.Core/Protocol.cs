@@ -14,7 +14,8 @@ public sealed class Request
 }
 
 // Superset of every verb's parameters. Each verb reads only the fields it needs.
-public sealed class RequestArgs
+// A record so the CLI can build a base (target) and layer verb-specific fields via `with`.
+public sealed record RequestArgs
 {
     [JsonPropertyName("path")] public string? Path { get; init; }
     [JsonPropertyName("line")] public int? Line { get; init; }

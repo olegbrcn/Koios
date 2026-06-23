@@ -156,66 +156,46 @@ static class Cli
             .ParseArguments<StatusOptions, ServeOptions, StopOptions, SearchOptions, OutlineOptions, DefOptions, HoverOptions,
                             RefsOptions, CallersOptions, ImplsOptions, InjectorsOptions, HierarchyOptions, DiagnosticsOptions>(args)
             .MapResult(
-                (StatusOptions o) => StatusAsync(o),
+                (StatusOptions o) => Route<StatusInfo>(o, new Request { Verb = "status" }, StatusText),
                 (ServeOptions o) => ServeAsync(o),
                 (StopOptions o) => StopAsync(o),
-                (SearchOptions o) => WithEngine(o, allowLoadFailure: false, (engine, oo) =>
+                (SearchOptions o) => Route<SymbolItem>(o, new Request
                 {
-                    var kinds = string.IsNullOrWhiteSpace(oo.Kinds)
-                        ? null
-                        : new HashSet<string>(oo.Kinds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
-                    return Task.FromResult(Emit(engine.Search(oo.Query, kinds, oo.Limit), oo.Format, SearchText));
-                }),
-                (OutlineOptions o) => WithEngine(o, allowLoadFailure: false,
-                    (engine, oo) => Task.FromResult(Emit(engine.Outline(oo.File), oo.Format, OutlineText))),
-                (DefOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
+                    Verb = "search",
+                    Args = new RequestArgs
+                    {
+                        Query = o.Query,
+                        Kinds = string.IsNullOrWhiteSpace(o.Kinds)
+                            ? null
+                            : o.Kinds.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+                        Limit = o.Limit,
+                    },
+                }, SearchText),
+                (OutlineOptions o) => Route<OutlineNode>(o, new Request { Verb = "outline", Args = new RequestArgs { File = o.File } }, OutlineText),
+                (DefOptions o) => RouteTarget<SymbolItem>(o, o.Target, o.Id, "def", t => t, SearchText),
+                (HoverOptions o) => RouteTarget<HoverItem>(o, o.Target, o.Id, "hover", t => t, HoverText),
+                (RefsOptions o) => RouteTarget<ReferenceItem>(o, o.Target, o.Id, "refs",
+                    t => t with { IncludeDeclaration = o.IncludeDeclaration, Limit = o.Limit }, RefsText),
+                (CallersOptions o) => RouteTarget<CallNode>(o, o.Target, o.Id, "callers",
+                    t => t with { Depth = o.Depth, Limit = o.Limit }, CallersText),
+                (ImplsOptions o) => RouteTarget<SymbolItem>(o, o.Target, o.Id, "impls",
+                    t => t with { Of = o.Of, Limit = o.Limit }, ImplsText),
+                (InjectorsOptions o) => RouteTarget<SymbolItem>(o, o.Target, o.Id, "injectors",
+                    t => t with { Limit = o.Limit }, InjectorsText),
+                (HierarchyOptions o) => RouteTarget<HierarchyItem>(o, o.Target, o.Id, "hierarchy",
+                    t => t with { Direction = o.Direction, Limit = o.Limit }, HierarchyText),
+                (DiagnosticsOptions o) => Route<DiagnosticItem>(o, new Request
                 {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.DefinitionAsync(t.path, t.line, t.col, t.id, default);
-                    return Emit(env, oo.Format, SearchText);
-                }),
-                (HoverOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.HoverAsync(t.path, t.line, t.col, t.id, default);
-                    return Emit(env, oo.Format, HoverText);
-                }),
-                (RefsOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.FindReferencesAsync(t.path, t.line, t.col, t.id, oo.IncludeDeclaration, oo.Limit, default);
-                    return Emit(env, oo.Format, RefsText);
-                }),
-                (CallersOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.CallersAsync(t.path, t.line, t.col, t.id, oo.Depth, oo.Limit, default);
-                    return Emit(env, oo.Format, CallersText);
-                }),
-                (ImplsOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.FindImplementationsAsync(t.path, t.line, t.col, t.id, oo.Of, oo.Limit, default);
-                    return Emit(env, oo.Format, ImplsText);
-                }),
-                (InjectorsOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.FindInjectorsAsync(t.path, t.line, t.col, t.id, oo.Limit, default);
-                    return Emit(env, oo.Format, InjectorsText);
-                }),
-                (HierarchyOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    if (!TryTarget(oo.Target, oo.Id, out var t)) return 1;
-                    var env = await engine.TypeHierarchyAsync(t.path, t.line, t.col, t.id, oo.Direction, oo.Limit, default);
-                    return Emit(env, oo.Format, HierarchyText);
-                }),
-                (DiagnosticsOptions o) => WithEngine(o, allowLoadFailure: false, async (engine, oo) =>
-                {
-                    var scope = oo.Scope ?? (oo.Path is not null ? "file" : "solution");
-                    var env = await engine.DiagnosticsAsync(scope, oo.Path, oo.Project, oo.MinSeverity, oo.Limit, default);
-                    return Emit(env, oo.Format, DiagnosticsText);
-                }),
+                    Verb = "diagnostics",
+                    Args = new RequestArgs
+                    {
+                        Scope = o.Scope ?? (o.Path is not null ? "file" : "solution"),
+                        Path = o.Path,
+                        Project = o.Project,
+                        MinSeverity = o.MinSeverity,
+                        Limit = o.Limit,
+                    },
+                }, DiagnosticsText),
                 // 0 for --help/--version, 1 for genuine parse/usage errors.
                 errs => Task.FromResult(errs.All(IsHelpOrVersion) ? 0 : 1));
 
@@ -226,82 +206,18 @@ static class Cli
     /// Resolve the solution, bring MSBuild up in the right order, load the workspace,
     /// then run the command body. Keeps the bootstrap ordering in one place.
     /// </summary>
-    static async Task<int> WithEngine<T>(T opts, bool allowLoadFailure, Func<Engine, T, Task<int>> body)
-        where T : GlobalOptions
-    {
-        var solution = opts.Solution
-            ?? Environment.GetEnvironmentVariable("KOIOS_SOLUTION")
-            ?? Directory.GetCurrentDirectory();
-
-        // Detect a repo-local .dotnet, then register MSBuild BEFORE any method that
-        // touches MSBuildWorkspace is JIT-compiled.
-        RepoSdk.Configure(solution);
-        MSBuildBootstrap.Register();
-
-        using var engine = new Engine();
-        try
-        {
-            await engine.LoadAsync(solution);
-        }
-        catch (Exception ex)
-        {
-            Console.Error.WriteLine($"error: failed to load '{solution}': {ex.Message}");
-            return 2;
-        }
-
-        // The solution couldn't be opened at all. `status` still reports the failure
-        // (and its remedy); every other command needs a loaded solution.
-        if (engine.LoadFailed && !allowLoadFailure)
-        {
-            if (opts.Format == "json")
-                Console.WriteLine(JsonSerializer.Serialize(new Envelope<object>
-                {
-                    Ok = false,
-                    State = "error",
-                    Error = new ErrorInfo
-                    {
-                        Code = "solution_not_loaded",
-                        Message = engine.FatalLoadError ?? "The solution failed to load.",
-                        Hint = "Run `koios status` for details.",
-                        Retryable = true,
-                    },
-                }, Json));
-            else
-                Console.Error.WriteLine($"error: solution not loaded: {engine.FatalLoadError ?? "unknown error"}");
-            return 3;
-        }
-
-        try
-        {
-            return await body(engine, opts);
-        }
-        catch (Exception ex)
-        {
-            if (opts.Format == "json")
-                Console.WriteLine(JsonSerializer.Serialize(new Envelope<object>
-                {
-                    Ok = false,
-                    State = "error",
-                    Error = new ErrorInfo { Code = "internal_error", Message = ex.Message, Retryable = false },
-                }, Json));
-            else
-                Console.Error.WriteLine($"error: {ex.Message}");
-            return 4;
-        }
-    }
-
     static string ResolveSolution(GlobalOptions o) =>
         o.Solution ?? Environment.GetEnvironmentVariable("KOIOS_SOLUTION") ?? Directory.GetCurrentDirectory();
 
-    // status routes to the resident; without one it fails with an actionable error
-    // (queries never cold-load — the only cold load is `serve`).
-    static async Task<int> StatusAsync(StatusOptions o)
+    // Every query verb routes to the resident; without one it fails with an actionable
+    // error (queries never cold-load — the only cold load is `serve`).
+    static async Task<int> Route<T>(GlobalOptions opts, Request request, Action<Envelope<T>> renderer)
     {
-        var solution = ResolveSolution(o);
+        var solution = ResolveSolution(opts);
         var sock = RuntimeDir.SocketPathFor(solution);
         if (!SocketClient.IsRunning(sock))
         {
-            var env = new Envelope<StatusInfo>
+            var env = new Envelope<T>
             {
                 Ok = false,
                 State = "error",
@@ -313,18 +229,28 @@ static class Cli
                     Retryable = false,
                 },
             };
-            return Emit(env, o.Format, StatusText);
+            return Emit(env, opts.Format, renderer);
         }
         try
         {
-            var env = await SocketClient.QueryAsync<StatusInfo>(sock, new Request { Verb = "status" }, default);
-            return Emit(env, o.Format, StatusText);
+            var env = await SocketClient.QueryAsync<T>(sock, request, default);
+            return Emit(env, opts.Format, renderer);
         }
         catch (Exception ex)
         {
             Console.Error.WriteLine($"error: {ex.Message}");
             return 4;
         }
+    }
+
+    // Target verbs: parse file:line:col / --id / bare name into the request, then route.
+    static Task<int> RouteTarget<T>(GlobalOptions opts, string? target, string? id, string verb,
+        Func<RequestArgs, RequestArgs> extra, Action<Envelope<T>> renderer)
+    {
+        if (!TryTarget(target, id, out var t))
+            return Task.FromResult(1);
+        var args = new RequestArgs { Path = t.path, Line = t.line, Col = t.col, SymbolId = t.id };
+        return Route(opts, new Request { Verb = verb, Args = extra(args) }, renderer);
     }
 
     static async Task<int> ServeAsync(ServeOptions o)

@@ -9,14 +9,18 @@ output of grep.
 
 ## Current state
 
-Koios has completed its [foundation and HOT-query tier](#foundation--hot-navigation)
-and its [relational queries](#relational-queries): a warm Roslyn workspace that
-projects a symbol catalog for name/position lookups and runs `SymbolFinder` /
-compiler diagnostics for cross-symbol queries, exposed through a CLI.
+Koios has completed its [foundation and HOT-query tier](#foundation--hot-navigation),
+its [relational queries](#relational-queries), and its [resident server](#resident-server):
+a warm Roslyn workspace that projects a symbol catalog for name/position lookups and runs
+`SymbolFinder` / compiler diagnostics for cross-symbol queries — held resident by
+`koios serve` and answered over a local socket, so each CLI query is a millisecond
+round-trip instead of a cold workspace load.
 
 | Command | What it does | Tier |
 | --- | --- | --- |
-| `koios status` | Load a solution/project and report health (projects, documents, symbols, load errors). | hot |
+| `koios serve` | Load the solution once and stay **resident**, serving queries over a local socket (foreground; Ctrl+C or `--idle-timeout` to stop). | — |
+| `koios stop` | Stop the resident server for the solution. | — |
+| `koios status` | Report health of the resident (projects, documents, symbols, uptime/requests). | hot |
 | `koios search <query>` | Ranked fuzzy symbol search (exact → prefix → camel-hump → substring). | hot |
 | `koios outline <file.cs>` | Structural outline (types → members) of a file. | hot |
 | `koios def <target>` | Go to definition (by name, `file:line:col`, or `--id <symbol_id>`). | hot_semantic |
@@ -42,6 +46,24 @@ solution. On an unrestored project, symbols still extract but `diagnostics` flag
 the result `degraded` (it would otherwise report missing-reference errors as if
 they were real).
 
+### Resident server
+
+Koios is meant to run **resident**. `koios serve` loads the workspace once (~tens of
+seconds for a large solution) and holds the warm `Engine`; every other `koios <verb>`
+is a thin client that connects to it over a per-solution Unix domain socket and
+answers in milliseconds. There is **no in-process fallback** — a query verb with no
+resident running fails fast with a `no_resident` error pointing you to `koios serve`.
+The socket is keyed by the absolute solution path (one resident per solution); the
+server self-shuts down after `--idle-timeout` minutes of inactivity, and `koios stop`
+ends it immediately.
+
+The resident serves a **fixed snapshot** — edits on disk are not picked up until you
+restart it (incremental re-projection via a file watcher is a later step).
+
+For an agent that fires many `koios` calls per session, start the resident once at the
+start of the session (e.g. a Claude Code `SessionStart` hook or a devcontainer
+`postStart`: `koios serve -s <solution> &`), and every subsequent query is warm.
+
 ## Roadmap
 
 Each step is a vertical slice that leaves the tool usable end-to-end.
@@ -56,6 +78,11 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   `diagnostics` via Roslyn `SymbolFinder` / compiler diagnostics — the capability
   that most decisively beats grep. (Outgoing callees and result memoization land
   with the resident host, where they pay off.)
+- <a id="resident-server"></a>**Resident server** (done)
+  `koios serve` holds the warm `Engine` and answers over a per-solution Unix domain
+  socket; every verb is a thin client (`koios stop` / idle-timeout end it). A single
+  shared dispatcher serves the socket today and the MCP host later. Auto-spawn of the
+  resident on first query is the next increment.
 - <a id="live-edits"></a>**Live edits**
   `FileSystemWatcher` with a debounced, incremental re-projection so edits are
   reflected within ~250 ms without a restart.
@@ -74,6 +101,8 @@ Requires a .NET 10 SDK; `dotnet build` produces the CLI at
 ```bash
 koios() { dotnet src/Koios.Cli/bin/Debug/net10.0/koios.dll "$@"; }
 
+koios serve    -s path/to/My.sln &       # start the resident once (loads the workspace)
+# … then every query below is a warm, millisecond round-trip to it:
 koios status   -s path/to/My.sln
 koios search   OrderService -s path/to/My.sln --kinds class,interface --limit 20
 koios outline  src/Orders/OrderService.cs -s path/to/My.sln
@@ -82,6 +111,7 @@ koios hover    --id "M:MyApp.Orders.OrderService.Submit(MyApp.Orders.Order)" -s 
 koios impls    IOrderHandler -s path/to/My.sln          # by bare name (unique match)
 koios impls    ICloudEventHandler --of VehicleRawDataReceivedEventMessage -s path/to/My.sln  # closed generic filter
 koios callers  Submit -s path/to/My.sln                 # ambiguous → lists candidate symbol_ids
+koios stop     -s path/to/My.sln                        # shut the resident down
 ```
 
 `-s`/`--solution` accepts a `.sln`, `.slnx`, `.csproj`, or a directory (a single

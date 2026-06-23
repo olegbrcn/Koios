@@ -15,7 +15,16 @@ built on Roslyn.
   - `Catalog.cs` — in-memory symbol projection + indexes + ranked search.
   - `Display.cs` — custom SymbolDisplayFormats (FQN, signature, type signature).
   - `Models.cs` — the canonical response envelope + result DTOs (snake_case JSON).
-- `src/Koios.Cli/` — thin CLI surface (assembly name `koios`). One-shot per invocation.
+  - `Protocol.cs` — wire model (`Request`/`RequestArgs`, newline-delimited compact JSON)
+    + `Dispatcher.DispatchAsync` — the single verb→Engine mapping shared by every
+    transport (the socket today, the MCP host later).
+  - `RuntimeDir.cs` — per-solution socket path (`{runtimeDir}/koios-{sha256(absPath)}.sock`).
+  - `Server.cs` — resident host: binds a Unix domain socket, handles requests
+    concurrently (the loaded `Solution` is immutable), per-request 2-min timeout,
+    idle self-shutdown, `shutdown` control verb.
+  - `SocketClient.cs` — thin client: `IsRunning`, `QueryAsync<T>`, `ShutdownAsync`.
+- `src/Koios.Cli/` — thin CLI surface (assembly name `koios`). Query verbs are a
+  socket round-trip to the resident; `serve` is the only path that loads an `Engine`.
   Argument parsing uses the **CommandLineParser** package: one `[Verb]` options class
   per subcommand, shared flags on a `GlobalOptions` base, dispatched via `MapResult`.
   `--help`/`--version`/usage errors are auto-generated (and go to stderr, keeping
@@ -23,11 +32,25 @@ built on Roslyn.
 
 ## Current state
 
-Foundation & HOT-query tier and relational queries complete (see the README roadmap).
-CLI commands: `status`, `search`, `outline`, `def`, `hover` (hot); `refs`, `callers`,
+Foundation & HOT-query tier, relational queries, and the resident server complete
+(see the README roadmap). CLI commands: `serve`, `stop` (lifecycle); `status`,
+`search`, `outline`, `def`, `hover` (hot); `refs`, `callers`,
 `impls` (with `--of <TypeArg>` for closed-generic filtering), `injectors`,
 `hierarchy`, `diagnostics` (relational, via `SymbolFinder` / compiler diagnostics).
 No watcher, SQLite, or MCP server yet.
+
+Resident model:
+- `koios serve` cold-loads the workspace once and holds the warm `Engine`; every query
+  verb is a thin client (`Route<T>`/`RouteTarget<T>` in Program.cs) that round-trips a
+  `Request` to the per-solution Unix socket and prints the returned `Envelope<T>`.
+- **No in-process fallback** — a query verb with no resident returns a `no_resident`
+  error (actionable hint to run `serve`). The only cold load lives in `ServeAsync`.
+- Server and client serialize with `Protocol.Wire` (compact, one message per line);
+  `Server` serializes the dispatch result by its runtime type so the boxed
+  `Envelope<T>` emits its real shape. `status` is answered by the server (it stamps
+  `ResidentInfo`: pid/uptime/requests); all other verbs go through `Dispatcher`.
+- Fixed snapshot: on-disk edits are not reflected until `serve` is restarted (watcher
+  is a later step). Idle-timeout (`--idle-timeout`, default 15 min) self-shuts down.
 
 Target resolution (`def`/`hover`/`refs`/`callers`/`impls`/`hierarchy`):
 - A target is `file:line:col`, a `symbol_id` (doc-comment id), or a **bare name**.
