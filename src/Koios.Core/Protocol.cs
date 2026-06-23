@@ -58,6 +58,8 @@ public static class Protocol
             "callers" => await engine.CallersAsync(a.Path, a.Line, a.Col, a.SymbolId, a.Depth, a.Limit, ct),
             "impls" => await engine.FindImplementationsAsync(a.Path, a.Line, a.Col, a.SymbolId, a.Of, a.Limit, ct),
             "injectors" => await engine.FindInjectorsAsync(a.Path, a.Line, a.Col, a.SymbolId, a.Limit, ct),
+            "deps" => await engine.FindDependenciesAsync(a.Path, a.Line, a.Col, a.SymbolId, a.Limit, ct),
+            "callees" => await engine.FindCalleesAsync(a.Path, a.Line, a.Col, a.SymbolId, a.Limit, ct),
             "hierarchy" => await engine.TypeHierarchyAsync(a.Path, a.Line, a.Col, a.SymbolId, a.Direction, a.Limit, ct),
             "diagnostics" => await engine.DiagnosticsAsync(a.Scope ?? "solution", a.Path, a.Project, a.MinSeverity, a.Limit, ct),
             _ => new Envelope<object>

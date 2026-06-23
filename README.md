@@ -29,6 +29,8 @@ round-trip instead of a cold workspace load.
 | `koios callers <target>` | Incoming call hierarchy (`--depth N`). | relational |
 | `koios impls <target> [--of <TypeArg>]` | Source implementations / overrides / derived types. `--of` filters to a closed generic (e.g. `--of VehicleRawDataReceivedEventMessage`). | relational |
 | `koios injectors <target>` | Classes that declare the target type as a constructor parameter (DI injection sites). | relational |
+| `koios deps <target>` | A type's constructor dependencies — what it injects (classic + primary ctors). Inverse of `injectors`. | relational |
+| `koios callees <target>` | Outgoing first-party calls made by a method, or by every method of a type. Inverse of `callers`. | relational |
 | `koios hierarchy <target>` | Base/interface and derived-type hierarchy (`--direction`). | relational |
 | `koios diagnostics [path]` | Compiler diagnostics for a file/project/solution (`--scope`, `--min-severity`). | relational |
 

@@ -118,6 +118,20 @@ sealed class InjectorsOptions : TargetOptions
     public int Limit { get; set; }
 }
 
+[Verb("deps", HelpText = "Constructor dependencies a type declares (what it injects). Inverse of injectors.")]
+sealed class DepsOptions : TargetOptions
+{
+    [Option("limit", Default = 100, HelpText = "Max results.")]
+    public int Limit { get; set; }
+}
+
+[Verb("callees", HelpText = "Outgoing first-party calls made by a method or every method of a type. Inverse of callers.")]
+sealed class CalleesOptions : TargetOptions
+{
+    [Option("limit", Default = 100, HelpText = "Max results.")]
+    public int Limit { get; set; }
+}
+
 [Verb("hierarchy", HelpText = "Base/interface and derived-type hierarchy of a type.")]
 sealed class HierarchyOptions : TargetOptions
 {
@@ -154,7 +168,7 @@ static class Cli
     public static Task<int> RunAsync(string[] args) =>
         Parser.Default
             .ParseArguments<StatusOptions, ServeOptions, StopOptions, SearchOptions, OutlineOptions, DefOptions, HoverOptions,
-                            RefsOptions, CallersOptions, ImplsOptions, InjectorsOptions, HierarchyOptions, DiagnosticsOptions>(args)
+                            RefsOptions, CallersOptions, ImplsOptions, InjectorsOptions, DepsOptions, CalleesOptions, HierarchyOptions, DiagnosticsOptions>(args)
             .MapResult(
                 (StatusOptions o) => Route<StatusInfo>(o, new Request { Verb = "status" }, StatusText),
                 (ServeOptions o) => ServeAsync(o),
@@ -182,6 +196,10 @@ static class Cli
                     t => t with { Of = o.Of, Limit = o.Limit }, ImplsText),
                 (InjectorsOptions o) => RouteTarget<SymbolItem>(o, o.Target, o.Id, "injectors",
                     t => t with { Limit = o.Limit }, InjectorsText),
+                (DepsOptions o) => RouteTarget<SymbolItem>(o, o.Target, o.Id, "deps",
+                    t => t with { Limit = o.Limit }, DepsText),
+                (CalleesOptions o) => RouteTarget<CallNode>(o, o.Target, o.Id, "callees",
+                    t => t with { Limit = o.Limit }, CalleesText),
                 (HierarchyOptions o) => RouteTarget<HierarchyItem>(o, o.Target, o.Id, "hierarchy",
                     t => t with { Direction = o.Direction, Limit = o.Limit }, HierarchyText),
                 (DiagnosticsOptions o) => Route<DiagnosticItem>(o, new Request
@@ -471,6 +489,32 @@ static class Cli
             Console.WriteLine($"{it.Relation,-11} {it.Kind,-10} {it.Name,-32} {loc}");
         }
         PrintFooter(env, env.Items.Count, "injector(s)");
+    }
+
+    static void DepsText(Envelope<SymbolItem> env)
+    {
+        if (!env.Ok) { Error(env); return; }
+        if (env.Items.Count == 0) Console.WriteLine("(none)");
+        foreach (var it in env.Items)
+        {
+            var loc = it.Loc is null ? (it.IsMetadata ? "[metadata]" : "") : $"{it.Loc.Path}:{it.Loc.Line}";
+            Console.WriteLine($"{it.Kind,-10} {it.Name,-32} {loc}");
+            if (it.Signature is { Length: > 0 } sig) Console.WriteLine($"           {Truncate(sig, 160)}");
+        }
+        PrintFooter(env, env.Items.Count, "dependency(ies)");
+    }
+
+    static void CalleesText(Envelope<CallNode> env)
+    {
+        if (!env.Ok) { Error(env); return; }
+        if (env.Items.Count == 0) Console.WriteLine("(none)");
+        foreach (var n in env.Items)
+        {
+            var where = n.CallSites.Count > 0 ? $"  ({n.CallSites[0].Path}:{n.CallSites[0].Line})" : "";
+            var container = n.Container is { Length: > 0 } ? $"{n.Container}." : "";
+            Console.WriteLine($"{container}{n.Name}{where}");
+        }
+        PrintFooter(env, env.Items.Count, "callee(s)");
     }
 
     static void HierarchyText(Envelope<HierarchyItem> env)

@@ -835,6 +835,133 @@ public sealed class Engine : IDisposable
         return Relational(items, sw, notes);
     }
 
+    // The inverse of `injectors`: the constructor dependencies a type declares (what it
+    // injects). Pure semantic API — `InstanceConstructors` already covers classic and
+    // primary constructors, so no syntax walking is needed.
+    public async Task<Envelope<SymbolItem>> FindDependenciesAsync(
+        string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(amb);
+        var symbol = res.Symbol;
+        if (symbol is null) return SymbolNotFound<SymbolItem>();
+        if (symbol is not INamedTypeSymbol type)
+            return InvalidArg<SymbolItem>("select a type (the class whose constructor dependencies you want)");
+
+        var ctors = type.InstanceConstructors
+            .Where(c => c.Parameters.Length > 0)
+            .OrderByDescending(c => c.Parameters.Length)
+            .ToList();
+        var notes = new List<string>();
+        if (ctors.Count == 0)
+            return Relational(Array.Empty<SymbolItem>(), sw,
+                new List<string> { "no constructor parameters (no injected dependencies)" });
+
+        var ctor = ctors[0];
+        if (ctors.Count > 1)
+            notes.Add($"{ctors.Count} constructors; showing the greediest ({ctor.Parameters.Length} params)");
+
+        var items = new List<SymbolItem>();
+        foreach (var p in ctor.Parameters)
+        {
+            var pt = p.Type;
+            var src = pt.Locations.FirstOrDefault(l => l.IsInSource);
+            items.Add(new SymbolItem
+            {
+                SymbolId = pt.OriginalDefinition.GetDocumentationCommentId(),
+                Name = pt.Name,
+                Kind = Display.KindOf(pt),
+                Container = pt.ContainingNamespace?.ToDisplayString(),
+                Signature = $"{pt.ToDisplayString(Display.Fqn)} {p.Name}",
+                Loc = src is not null ? LocFrom(src) : null,
+                Relation = "injects",
+                IsMetadata = src is null,
+                Source = "semantic",
+            });
+        }
+        if (items.Count > limit) items = items.Take(limit).ToList();
+        return Relational(items, sw, notes);
+    }
+
+    // Outgoing calls (the inverse of `callers`): first-party methods invoked by the
+    // target method, or by every method of the target type. Source-only — calls into
+    // metadata/BCL are counted and reported, not listed.
+    public async Task<Envelope<CallNode>> FindCalleesAsync(
+        string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
+    {
+        var sw = Stopwatch.StartNew();
+        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<CallNode>(amb);
+        var symbol = res.Symbol;
+        if (symbol is null) return SymbolNotFound<CallNode>();
+
+        IEnumerable<IMethodSymbol> methods = symbol switch
+        {
+            IMethodSymbol m => new[] { m },
+            INamedTypeSymbol t => t.GetMembers().OfType<IMethodSymbol>(),
+            _ => Array.Empty<IMethodSymbol>(),
+        };
+        if (!methods.Any())
+            return InvalidArg<CallNode>("select a method or a type");
+
+        var sites = new Dictionary<string, List<Loc>>(StringComparer.Ordinal);
+        var meta = new Dictionary<string, IMethodSymbol>(StringComparer.Ordinal);
+        var order = new List<string>();
+        var metaOmitted = 0;
+
+        foreach (var method in methods)
+        {
+            foreach (var sref in method.DeclaringSyntaxReferences)
+            {
+                var node = await sref.GetSyntaxAsync(ct);
+                var doc = solution!.GetDocument(node.SyntaxTree);
+                if (doc is null) continue;
+                var model = await doc.GetSemanticModelAsync(ct);
+                if (model is null) continue;
+                foreach (var inv in node.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                {
+                    var info = model.GetSymbolInfo(inv, ct);
+                    if ((info.Symbol ?? info.CandidateSymbols.FirstOrDefault()) is not IMethodSymbol callee) continue;
+                    var target = callee.OriginalDefinition;
+                    if (!target.Locations.Any(l => l.IsInSource)) { metaOmitted++; continue; }
+                    var id = target.GetDocumentationCommentId() ?? target.ToDisplayString();
+                    if (!sites.TryGetValue(id, out var list))
+                    {
+                        list = new List<Loc>();
+                        sites[id] = list;
+                        meta[id] = target;
+                        order.Add(id);
+                    }
+                    var loc = inv.GetLocation();
+                    if (loc.IsInSource) list.Add(LocFrom(loc));
+                }
+            }
+        }
+
+        var items = order
+            .Select(id =>
+            {
+                var t = meta[id];
+                return new CallNode
+                {
+                    SymbolId = t.GetDocumentationCommentId(),
+                    Name = t.Name,
+                    Kind = Display.KindOf(t),
+                    Container = t.ContainingType?.ToDisplayString(Display.Fqn),
+                    CallSites = sites[id],
+                    Depth = 1,
+                };
+            })
+            .OrderBy(n => n.Container, StringComparer.Ordinal).ThenBy(n => n.Name, StringComparer.Ordinal)
+            .ToList();
+        var notes = new List<string>();
+        if (items.Count == 0) notes.Add("no first-party calls found in source");
+        if (metaOmitted > 0) notes.Add($"{metaOmitted} call(s) to metadata/BCL members omitted (source only)");
+        if (items.Count > limit) items = items.Take(limit).ToList();
+        return Relational(items, sw, notes);
+    }
+
     // Walk up from a type reference to the class that injects it. The reference must be
     // part of a constructor parameter's declared *type* (not its default value or an
     // attribute), in either a classic constructor or a primary constructor (whose
