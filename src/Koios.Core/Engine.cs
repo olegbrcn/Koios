@@ -849,9 +849,13 @@ public sealed class Engine : IDisposable
         if (symbol is not INamedTypeSymbol type)
             return InvalidArg<SymbolItem>("select a type (the class whose constructor dependencies you want)");
 
+        // Skip compiler-synthesized constructors — a record's copy ctor takes the record
+        // itself as its one parameter and would masquerade as a dependency. Tie-break by
+        // declaration order so the pick is deterministic.
         var ctors = type.InstanceConstructors
-            .Where(c => c.Parameters.Length > 0)
+            .Where(c => !c.IsImplicitlyDeclared && c.Parameters.Length > 0)
             .OrderByDescending(c => c.Parameters.Length)
+            .ThenBy(c => c.DeclaringSyntaxReferences.FirstOrDefault()?.Span.Start ?? int.MaxValue)
             .ToList();
         var notes = new List<string>();
         if (ctors.Count == 0)
@@ -884,9 +888,10 @@ public sealed class Engine : IDisposable
         return Relational(items, sw, notes);
     }
 
-    // Outgoing calls (the inverse of `callers`): first-party methods invoked by the
-    // target method, or by every method of the target type. Source-only — calls into
-    // metadata/BCL are counted and reported, not listed.
+    // Outgoing calls (the inverse of `callers`): first-party members used by the
+    // target method, or by every method of the target type — method invocations,
+    // constructor calls (incl. target-typed new), and property/indexer accesses.
+    // Source-only — calls into metadata/BCL are counted and reported, not listed.
     public async Task<Envelope<CallNode>> FindCalleesAsync(
         string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
     {
@@ -906,9 +911,24 @@ public sealed class Engine : IDisposable
             return InvalidArg<CallNode>("select a method or a type");
 
         var sites = new Dictionary<string, List<Loc>>(StringComparer.Ordinal);
-        var meta = new Dictionary<string, IMethodSymbol>(StringComparer.Ordinal);
+        var meta = new Dictionary<string, ISymbol>(StringComparer.Ordinal);
         var order = new List<string>();
         var metaOmitted = 0;
+
+        void Record(ISymbol callee, Location loc)
+        {
+            var target = callee.OriginalDefinition;
+            if (!target.Locations.Any(l => l.IsInSource)) { metaOmitted++; return; }
+            var id = target.GetDocumentationCommentId() ?? target.ToDisplayString();
+            if (!sites.TryGetValue(id, out var list))
+            {
+                list = new List<Loc>();
+                sites[id] = list;
+                meta[id] = target;
+                order.Add(id);
+            }
+            if (loc.IsInSource) list.Add(LocFrom(loc));
+        }
 
         foreach (var method in methods)
         {
@@ -919,22 +939,34 @@ public sealed class Engine : IDisposable
                 if (doc is null) continue;
                 var model = await doc.GetSemanticModelAsync(ct);
                 if (model is null) continue;
-                foreach (var inv in node.DescendantNodes().OfType<InvocationExpressionSyntax>())
+                foreach (var n in node.DescendantNodes())
                 {
-                    var info = model.GetSymbolInfo(inv, ct);
-                    if ((info.Symbol ?? info.CandidateSymbols.FirstOrDefault()) is not IMethodSymbol callee) continue;
-                    var target = callee.OriginalDefinition;
-                    if (!target.Locations.Any(l => l.IsInSource)) { metaOmitted++; continue; }
-                    var id = target.GetDocumentationCommentId() ?? target.ToDisplayString();
-                    if (!sites.TryGetValue(id, out var list))
+                    switch (n)
                     {
-                        list = new List<Loc>();
-                        sites[id] = list;
-                        meta[id] = target;
-                        order.Add(id);
+                        case InvocationExpressionSyntax or BaseObjectCreationExpressionSyntax:
+                        {
+                            // Method calls and constructor calls (incl. target-typed new()).
+                            var info = model.GetSymbolInfo(n, ct);
+                            if ((info.Symbol ?? info.CandidateSymbols.FirstOrDefault()) is IMethodSymbol callee)
+                                Record(callee, n.GetLocation());
+                            break;
+                        }
+                        case ElementAccessExpressionSyntax element:
+                        {
+                            // Indexer accesses.
+                            if (model.GetSymbolInfo(element, ct).Symbol is IPropertySymbol indexer)
+                                Record(indexer, element.GetLocation());
+                            break;
+                        }
+                        case SimpleNameSyntax name:
+                        {
+                            // Property accessor calls. Resolving the simple name (not the
+                            // enclosing member-access) counts each access exactly once.
+                            if (model.GetSymbolInfo(name, ct).Symbol is IPropertySymbol prop)
+                                Record(prop, name.GetLocation());
+                            break;
+                        }
                     }
-                    var loc = inv.GetLocation();
-                    if (loc.IsInSource) list.Add(LocFrom(loc));
                 }
             }
         }
