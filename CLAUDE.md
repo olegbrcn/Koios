@@ -72,7 +72,7 @@ Relational notes:
 - `impls --of <TypeArg>` post-filters to implementers of the closed generic
   `IFace<TypeArg>`. Matching is done via `OriginalDefinition` doc-comment id (stable
   across compilations) + first type argument `Name` (case-insensitive). A `notes`
-  line reports the narrowing (e.g. `"filtered to ICloudEventHandler<VehicleRawDataReceivedEventMessage>: 79 → 32"`).
+  line reports the narrowing (e.g. `"filtered to IHandler<OrderCreated>: 79 → 32"`).
 - `injectors` resolves a type, runs `FindReferencesAsync`, and keeps references whose
   syntax context is a constructor parameter's *type* (`ConstructorInjectorType` walks up
   to the injecting `TypeDeclarationSyntax`, ignoring default values/attributes). Handles

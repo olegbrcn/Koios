@@ -27,7 +27,7 @@ round-trip instead of a cold workspace load.
 | `koios hover <target>` | Signature, container, XML-doc summary (by name, `file:line:col`, or `--id`). | hot_semantic |
 | `koios refs <target>` | All references (read/write/call-classified) to a symbol. | relational |
 | `koios callers <target>` | Incoming call hierarchy (`--depth N`). | relational |
-| `koios impls <target> [--of <TypeArg>]` | Source implementations / overrides / derived types. `--of` filters to a closed generic (e.g. `--of VehicleRawDataReceivedEventMessage`). | relational |
+| `koios impls <target> [--of <TypeArg>]` | Source implementations / overrides / derived types. `--of` filters to a closed generic (e.g. `impls IHandler --of OrderCreated` → implementers of `IHandler<OrderCreated>`). | relational |
 | `koios injectors <target>` | Classes that declare the target type as a constructor parameter (DI injection sites). | relational |
 | `koios deps <target>` | A type's constructor dependencies — what it injects (classic + primary ctors). Inverse of `injectors`. | relational |
 | `koios callees <target>` | Outgoing first-party calls made by a method, or by every method of a type. Inverse of `callers`. | relational |
@@ -76,10 +76,10 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   `goto-definition`, `hover`, and `outline` (with the `hot` / `hot_semantic` split)
   through a CLI with JSON/text output and repo-local SDK auto-detection.
 - <a id="relational-queries"></a>**Relational queries** (done)
-  `refs`, `callers` (incoming call hierarchy), `impls`, `hierarchy`, and
-  `diagnostics` via Roslyn `SymbolFinder` / compiler diagnostics — the capability
-  that most decisively beats grep. (Outgoing callees and result memoization land
-  with the resident host, where they pay off.)
+  `refs`, `callers`/`callees`, `impls` (with `--of`), `injectors`/`deps`,
+  `hierarchy`, and `diagnostics` via Roslyn `SymbolFinder` / compiler
+  diagnostics — the capability that most decisively beats grep. (Result
+  memoization is a later increment now that the resident host exists.)
 - <a id="resident-server"></a>**Resident server** (done)
   `koios serve` holds the warm `Engine` and answers over a per-solution Unix domain
   socket; every verb is a thin client (`koios stop` / idle-timeout end it). A single
@@ -111,7 +111,7 @@ koios outline  src/Orders/OrderService.cs -s path/to/My.sln
 koios def      src/Orders/OrderService.cs:52:25 -s path/to/My.sln
 koios hover    --id "M:MyApp.Orders.OrderService.Submit(MyApp.Orders.Order)" -s path/to/My.sln --format json
 koios impls    IOrderHandler -s path/to/My.sln          # by bare name (unique match)
-koios impls    ICloudEventHandler --of VehicleRawDataReceivedEventMessage -s path/to/My.sln  # closed generic filter
+koios impls    IHandler --of OrderCreated -s path/to/My.sln   # implementers of IHandler<OrderCreated>
 koios callers  Submit -s path/to/My.sln                 # ambiguous → lists candidate symbol_ids
 koios stop     -s path/to/My.sln                        # shut the resident down
 ```
@@ -128,7 +128,7 @@ A solution's `global.json` may pin an SDK that isn't installed system-wide:
   above the target (including a user-level `~/.dotnet`), Koios uses it automatically,
   so no manual env wiring is needed.
 - **Explicit pin** — set `KOIOS_MSBUILD_PATH` to an installed SDK directory.
-- **Unsatisfiable pin** — if the pinned SDK can't be resolved at all, the load
-  fails gracefully: `koios status` reports `state: error` with an actionable message
-  (pinned vs installed versions and how to fix), and other commands return a
-  structured `solution_not_loaded` error instead of a raw MSBuild stack trace.
+- **Unsatisfiable pin** — if the pinned SDK can't be resolved at all, `koios serve`
+  fails gracefully with an actionable message (pinned vs installed versions and how
+  to fix) instead of a raw MSBuild stack trace; query verbs report `no_resident`
+  until a resident is successfully started.

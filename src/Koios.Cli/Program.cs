@@ -104,7 +104,7 @@ sealed class CallersOptions : TargetOptions
 [Verb("impls", HelpText = "Implementations / overrides / derived types of the target.")]
 sealed class ImplsOptions : TargetOptions
 {
-    [Option("of", HelpText = "Filter to the closed generic where the first type argument matches this name (e.g. --of VehicleRawDataReceivedEventMessage).")]
+    [Option("of", HelpText = "Filter to the closed generic where the first type argument matches this name (e.g. `impls IHandler --of OrderCreated` for IHandler<OrderCreated>).")]
     public string? Of { get; set; }
 
     [Option("limit", Default = 100, HelpText = "Max results.")]
