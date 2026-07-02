@@ -34,15 +34,27 @@ built on Roslyn.
   per subcommand, shared flags on a `GlobalOptions` base, dispatched via `MapResult`.
   `--help`/`--version`/usage errors are auto-generated (and go to stderr, keeping
   stdout JSON-clean).
+- `src/Koios.Mcp/` — MCP stdio server (assembly name `koios-mcp`, official
+  `ModelContextProtocol` SDK). Owns the Engine **in-process** (it IS the resident
+  an agent spawns; no socket round-trip). `EngineHost` cold-loads in the
+  background so the JSON-RPC handshake answers immediately — tools await
+  readiness, `koios_status` reports `loading`/`error` without blocking — then
+  starts the `Watcher`. `KoiosTools` is one thin `[McpServerTool]` per verb over
+  `Protocol.DispatchAsync`, serialized with `Protocol.Pretty` (identical to CLI
+  `--format json`; golden-checked). stdout carries JSON-RPC only — ALL logging
+  goes to stderr. Registered for this repo in `.mcp.json`; the skill in
+  `.claude/skills/koios/SKILL.md` steers agents to `koios_*` over grep/Read.
 
 ## Current state
 
-Foundation & HOT-query tier, relational queries, the resident server, and live
-edits complete (see the README roadmap). CLI commands: `serve`, `stop`
-(lifecycle); `status`, `search`, `outline`, `def`, `hover` (hot); `refs`,
-`callers`, `impls` (with `--of <TypeArg>` for closed-generic filtering),
-`injectors`, `hierarchy`, `diagnostics` (relational, via `SymbolFinder` /
-compiler diagnostics). No SQLite or MCP server yet.
+Foundation & HOT-query tier, relational queries, the resident server, live
+edits, and the MCP agent surface complete (see the README roadmap). CLI
+commands: `serve`, `stop` (lifecycle); `status`, `search`, `outline`, `def`,
+`hover` (hot); `refs`, `callers`, `impls` (with `--of <TypeArg>` for
+closed-generic filtering), `injectors`, `hierarchy`, `diagnostics` (relational,
+via `SymbolFinder` / compiler diagnostics). Every verb is also a `koios_*` MCP
+tool. No relational memoization or SQLite warm-start yet; target parsing and
+JSON shape are shared via `Protocol.TargetArgs` / `Protocol.Pretty`.
 
 Resident model:
 - `koios serve` cold-loads the workspace once and holds the warm `Engine`; every query

@@ -166,7 +166,6 @@ sealed class DiagnosticsOptions : GlobalOptions
 
 static class Cli
 {
-    static readonly JsonSerializerOptions Json = new() { WriteIndented = true };
 
     public static Task<int> RunAsync(string[] args) =>
         Parser.Default
@@ -268,9 +267,14 @@ static class Cli
     static Task<int> RouteTarget<T>(GlobalOptions opts, string? target, string? id, string verb,
         Func<RequestArgs, RequestArgs> extra, Action<Envelope<T>> renderer)
     {
-        if (!TryTarget(target, id, out var t))
+        var args = !string.IsNullOrEmpty(id) ? new RequestArgs { SymbolId = id }
+            : !string.IsNullOrEmpty(target) ? Protocol.TargetArgs(target)
+            : null;
+        if (args is null)
+        {
+            Console.Error.WriteLine("error: provide a target as file:line:col, a symbol name, or --id <symbol_id>.");
             return Task.FromResult(1);
-        var args = new RequestArgs { Path = t.path, Line = t.line, Col = t.col, SymbolId = t.id };
+        }
         return Route(opts, new Request { Verb = verb, Args = extra(args) }, renderer);
     }
 
@@ -365,32 +369,10 @@ static class Cli
         }
     }
 
-    // A target is either `file:line:col` or a symbol_id (via positional or --id).
-    static bool TryTarget(string? target, string? id, out (string? path, int? line, int? col, string? id) t)
-    {
-        if (!string.IsNullOrEmpty(id))
-        {
-            t = (null, null, null, id);
-            return true;
-        }
-        if (!string.IsNullOrEmpty(target))
-        {
-            var parts = target.Split(':');
-            if (parts.Length == 3 && int.TryParse(parts[1], out var line) && int.TryParse(parts[2], out var col))
-                t = (parts[0], line, col, null);
-            else
-                t = (null, null, null, target); // a symbol_id (monikers carry a single ':')
-            return true;
-        }
-        Console.Error.WriteLine("error: provide a target as file:line:col, a symbol name, or --id <symbol_id>.");
-        t = default;
-        return false;
-    }
-
     static int Emit<T>(Envelope<T> env, string format, Action<Envelope<T>> text)
     {
         if (format == "json")
-            Console.WriteLine(JsonSerializer.Serialize(env, Json));
+            Console.WriteLine(JsonSerializer.Serialize(env, Protocol.Pretty));
         else
             text(env);
         return env.Ok ? 0 : 3;

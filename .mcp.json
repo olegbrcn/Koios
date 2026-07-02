@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "koios": {
+      "command": "dotnet",
+      "args": ["src/Koios.Mcp/bin/Debug/net10.0/koios-mcp.dll"]
+    }
+  }
+}

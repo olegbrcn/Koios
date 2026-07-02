@@ -41,6 +41,22 @@ public static class Protocol
     // Compact (single-line) — required for newline framing on the wire.
     public static readonly JsonSerializerOptions Wire = new() { WriteIndented = false };
 
+    // Human/agent-facing JSON. Every surface (CLI --format json, MCP tool results)
+    // serializes envelopes with THIS so their output is byte-identical.
+    public static readonly JsonSerializerOptions Pretty = new() { WriteIndented = true };
+
+    /// <summary>Parse a target string into request args: `file:line:col` becomes a
+    /// positional target, anything else lands in the symbol_id slot (a symbol_id or
+    /// a bare name — monikers carry a single ':', never two). Shared by every
+    /// surface so CLI and MCP resolve targets identically.</summary>
+    public static RequestArgs TargetArgs(string target)
+    {
+        var parts = target.Split(':');
+        if (parts.Length == 3 && int.TryParse(parts[1], out var line) && int.TryParse(parts[2], out var col))
+            return new RequestArgs { Path = parts[0], Line = line, Col = col };
+        return new RequestArgs { SymbolId = target };
+    }
+
     // Single mapping from verb to Engine call, shared by every transport. Returns the
     // boxed Envelope<T> (serialize via its runtime type). `status` is handled by the
     // server (it injects ResidentInfo) and so is not reached here in practice.

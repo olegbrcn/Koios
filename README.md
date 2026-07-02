@@ -11,11 +11,12 @@ output of grep.
 
 Koios has completed its [foundation and HOT-query tier](#foundation--hot-navigation),
 its [relational queries](#relational-queries), its [resident server](#resident-server),
-and [live edits](#live-edits): a warm Roslyn workspace that projects a symbol catalog
-for name/position lookups and runs `SymbolFinder` / compiler diagnostics for
-cross-symbol queries — held resident by `koios serve`, kept current by a file
-watcher as you edit, and answered over a local socket, so each CLI query is a
-millisecond round-trip instead of a cold workspace load.
+[live edits](#live-edits), and its [agent surface](#agent-surface--packaging): a warm
+Roslyn workspace that projects a symbol catalog for name/position lookups and runs
+`SymbolFinder` / compiler diagnostics for cross-symbol queries — held resident, kept
+current by a file watcher as you edit, and answered in milliseconds over two
+surfaces: a per-solution local socket for the CLI (`koios serve`), and an MCP stdio
+server (`koios-mcp`) exposing every verb as a `koios_*` tool for AI agents.
 
 | Command | What it does | Tier |
 | --- | --- | --- |
@@ -98,12 +99,19 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   or bulk storms (500+ files, deleted source directories) escalate to a full
   background reload that serves the previous snapshot until the swap — and keeps
   serving it (with the error in `status`) if the reload fails.
+- <a id="agent-surface--packaging"></a>**Agent surface** (done)
+  `src/Koios.Mcp` — an MCP stdio server (official `ModelContextProtocol` SDK)
+  exposing one `koios_*` tool per verb over the same shared dispatcher, so MCP
+  and CLI output are identical. The MCP host owns the Engine **in-process**: it
+  is the long-lived resident an agent spawns — the workspace cold-loads in the
+  background (the handshake answers immediately; `koios_status` reports
+  `loading` meanwhile) and the file watcher keeps it current. Registered for
+  this repo via `.mcp.json` + a skill (`.claude/skills/koios/SKILL.md`) that
+  steers agents to `koios_*` over grep/Read. Marketplace-style plugin packaging
+  ships with distribution (below).
 - <a id="persistence--warm-start"></a>**Persistence & warm start**
   Write-through SQLite mirror of the catalog for instant warm-start and an offline
-  CLI fallback.
-- <a id="agent-surface--packaging"></a>**Agent surface & packaging**
-  An MCP stdio server exposing `koios_*` tools, packaged as a Claude Code skill +
-  plugin so an agent uses Koios instead of grepping.
+  CLI fallback. (Relational memoization keyed by `snapshot_id` lands alongside.)
 
 ## Usage
 
@@ -129,6 +137,29 @@ koios stop     -s path/to/My.sln                        # shut the resident down
 `-s`/`--solution` accepts a `.sln`, `.slnx`, `.csproj`, or a directory (a single
 solution/project is auto-discovered). It also defaults to `$KOIOS_SOLUTION` or the
 current directory.
+
+### Agent usage (MCP)
+
+Register the MCP server in any C# repo's `.mcp.json` (Claude Code picks it up and
+spawns it with the repo as its working directory, so the solution is auto-discovered):
+
+```json
+{
+  "mcpServers": {
+    "koios": {
+      "command": "dotnet",
+      "args": ["/path/to/koios-mcp.dll"]
+    }
+  }
+}
+```
+
+Pass `-s <solution>` in `args` (or set `KOIOS_SOLUTION` in `env`) when the repo
+holds more than one solution. The server owns the warm engine in-process — the
+workspace loads in the background after spawn (`koios_status` reports `loading`
+until it is ready) and the file watcher keeps it current for the whole session.
+A skill (`.claude/skills/koios/SKILL.md` in this repo) tells the agent when to
+prefer `koios_*` tools over grep/Read.
 
 ## SDK resolution
 
