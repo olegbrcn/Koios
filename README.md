@@ -10,15 +10,16 @@ output of grep.
 ## Current state
 
 Koios has completed its [foundation and HOT-query tier](#foundation--hot-navigation),
-its [relational queries](#relational-queries), and its [resident server](#resident-server):
-a warm Roslyn workspace that projects a symbol catalog for name/position lookups and runs
-`SymbolFinder` / compiler diagnostics for cross-symbol queries — held resident by
-`koios serve` and answered over a local socket, so each CLI query is a millisecond
-round-trip instead of a cold workspace load.
+its [relational queries](#relational-queries), its [resident server](#resident-server),
+and [live edits](#live-edits): a warm Roslyn workspace that projects a symbol catalog
+for name/position lookups and runs `SymbolFinder` / compiler diagnostics for
+cross-symbol queries — held resident by `koios serve`, kept current by a file
+watcher as you edit, and answered over a local socket, so each CLI query is a
+millisecond round-trip instead of a cold workspace load.
 
 | Command | What it does | Tier |
 | --- | --- | --- |
-| `koios serve` | Load the solution once and stay **resident**, serving queries over a local socket (foreground; Ctrl+C or `--idle-timeout` to stop). | — |
+| `koios serve` | Load the solution once and stay **resident**, serving queries over a local socket and tracking on-disk edits live (foreground; Ctrl+C or `--idle-timeout` to stop; `--no-watch` for a fixed snapshot). | — |
 | `koios stop` | Stop the resident server for the solution. | — |
 | `koios status` | Report health of the resident (projects, documents, symbols, uptime/requests). | hot |
 | `koios search <query>` | Ranked fuzzy symbol search (exact → prefix → camel-hump → substring). | hot |
@@ -59,8 +60,10 @@ The socket is keyed by the absolute solution path (one resident per solution); t
 server self-shuts down after `--idle-timeout` minutes of inactivity, and `koios stop`
 ends it immediately.
 
-The resident serves a **fixed snapshot** — edits on disk are not picked up until you
-restart it (incremental re-projection via a file watcher is a later step).
+The resident stays **current**: a file watcher applies on-disk edits to the warm
+snapshot within ~300 ms (see [live edits](#live-edits)), so there is no need to
+restart it as you work. `--no-watch` disables the watcher and serves a fixed
+snapshot.
 
 For an agent that fires many `koios` calls per session, start the resident once at the
 start of the session (e.g. a Claude Code `SessionStart` hook or a devcontainer
@@ -85,9 +88,16 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   socket; every verb is a thin client (`koios stop` / idle-timeout end it). A single
   shared dispatcher serves the socket today and the MCP host later. Auto-spawn of the
   resident on first query is the next increment.
-- <a id="live-edits"></a>**Live edits**
-  `FileSystemWatcher` with a debounced, incremental re-projection so edits are
-  reflected within ~250 ms without a restart.
+- <a id="live-edits"></a>**Live edits** (done)
+  A `FileSystemWatcher` in the resident keeps the snapshot current: debounced,
+  coalesced batches of `.cs` edits are applied incrementally (new text / added /
+  removed documents, only the touched files re-projected) as one atomic snapshot
+  swap — queries always read a consistent snapshot, and every response carries
+  its `snapshot_id` (`sln@N`). Changes to the project graph (`.csproj`, `.props`,
+  `.targets`, `.sln`/`.slnx`, `global.json`, `nuget.config`), watcher overflow,
+  or bulk storms (500+ files, deleted source directories) escalate to a full
+  background reload that serves the previous snapshot until the swap — and keeps
+  serving it (with the error in `status`) if the reload fails.
 - <a id="persistence--warm-start"></a>**Persistence & warm start**
   Write-through SQLite mirror of the catalog for instant warm-start and an offline
   CLI fallback.

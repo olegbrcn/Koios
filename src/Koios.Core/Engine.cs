@@ -1,4 +1,3 @@
-using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Xml.Linq;
 using Microsoft.CodeAnalysis;
@@ -11,28 +10,65 @@ using Microsoft.CodeAnalysis.Text;
 namespace Koios.Core;
 
 /// <summary>
-/// The warm Roslyn engine. For this first iteration it loads one solution/project,
-/// projects a catalog, and answers the HOT-tier queries (the foundation + HOT slice).
+/// The warm Roslyn engine. Loads one solution/project, projects a catalog, and
+/// answers hot + relational queries against an immutable snapshot.
+///
+/// Concurrency model: queries capture the current <see cref="Snapshot"/> once at
+/// entry and read only from it, so they stay consistent while the watcher swaps
+/// snapshots underneath. All mutation (<see cref="ApplyCsBatchAsync"/>,
+/// <see cref="ReloadAsync"/>) is single-writer — only the watcher's apply loop
+/// (or the initial load, before serving starts) may call it.
 /// </summary>
 public sealed class Engine : IDisposable
 {
+    /// <summary>One immutable, queryable state of the world. Swapped atomically;
+    /// Version feeds the wire-visible snapshot_id ("sln@N").</summary>
+    private sealed record Snapshot(Solution Solution, Catalog Catalog, int Version)
+    {
+        public string Id => $"sln@{Version}";
+    }
+
     private MSBuildWorkspace? workspace;
-    private Solution? solution;
-    private Catalog catalog = new();
+    private volatile Snapshot? current;
     private readonly List<string> loadErrors = new();
     private string? fatalLoadError;
     private string root = "";
     private string solutionFile = "";
+    private string targetPath = "";
     private string msbuild = "";
     private long loadMs;
     private int projectsTotal, projectsLoaded, projectsFailed, documents;
 
-    public const string SnapshotId = "sln@1";
     public string Root => root;
+    public string SnapshotId => current?.Id ?? "sln@0";
 
-    public IReadOnlyList<string> LoadErrors => loadErrors;
+    public IReadOnlyList<string> LoadErrors { get { lock (loadErrors) return loadErrors.ToArray(); } }
+
+    private Snapshot Snap() => current ?? throw new InvalidOperationException("engine not loaded");
 
     public async Task LoadAsync(string path, CancellationToken ct = default)
+    {
+        var full = Path.GetFullPath(path);
+        if (Directory.Exists(full))
+            full = ResolveInDirectory(full);
+
+        var ext = Path.GetExtension(full).ToLowerInvariant();
+        if (ext is not (".sln" or ".slnx" or ".slnf" or ".csproj"))
+            throw new ArgumentException($"Unsupported target '{path}'. Expected a .sln/.slnx/.csproj or a directory.");
+
+        root = Path.GetDirectoryName(full) ?? full;
+        solutionFile = Path.GetFileName(full);
+        targetPath = full;
+
+        await OpenAndSwapAsync(initial: true, ct);
+    }
+
+    /// <summary>Reopen the solution from disk in a fresh workspace and swap the
+    /// snapshot. On failure the previous snapshot keeps serving and the error is
+    /// recorded. Single-writer: watcher apply loop only.</summary>
+    public Task<bool> ReloadAsync(CancellationToken ct = default) => OpenAndSwapAsync(initial: false, ct);
+
+    private async Task<bool> OpenAndSwapAsync(bool initial, CancellationToken ct)
     {
         var sw = Stopwatch.StartNew();
         msbuild = MSBuildBootstrap.Register();
@@ -45,6 +81,7 @@ public sealed class Engine : IDisposable
         };
         var ws = MSBuildWorkspace.Create(props);
         ws.SkipUnrecognizedProjects = true;
+        var errors = new List<string>();
         ws.WorkspaceFailed += (_, e) =>
         {
             if (e.Diagnostic.Kind != WorkspaceDiagnosticKind.Failure)
@@ -55,52 +92,58 @@ public sealed class Engine : IDisposable
             if (msg.Contains("NU1903") || msg.Contains("known high severity vulnerability")
                 || msg.Contains("known moderate severity vulnerability"))
                 return;
-            lock (loadErrors) loadErrors.Add(msg);
+            lock (errors) errors.Add(msg);
         };
-        workspace = ws;
 
-        var full = Path.GetFullPath(path);
-        if (Directory.Exists(full))
-            full = ResolveInDirectory(full);
-
-        var ext = Path.GetExtension(full).ToLowerInvariant();
-        if (ext is not (".sln" or ".slnx" or ".slnf" or ".csproj"))
-            throw new ArgumentException($"Unsupported target '{path}'. Expected a .sln/.slnx/.csproj or a directory.");
-
-        root = Path.GetDirectoryName(full) ?? full;
-        solutionFile = Path.GetFileName(full);
-
+        Solution opened;
         try
         {
-            if (ext == ".csproj")
-            {
-                var proj = await ws.OpenProjectAsync(full, cancellationToken: ct);
-                solution = proj.Solution;
-            }
+            if (targetPath.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                opened = (await ws.OpenProjectAsync(targetPath, cancellationToken: ct)).Solution;
             else
-            {
-                solution = await ws.OpenSolutionAsync(full, cancellationToken: ct);
-            }
+                opened = await ws.OpenSolutionAsync(targetPath, cancellationToken: ct);
         }
         catch (Exception ex)
         {
-            // The solution could not be opened at all (most often a global.json SDK
-            // pin that is not installed). Degrade to an error state with an actionable
-            // message instead of crashing — status must keep working.
-            fatalLoadError = HumanizeLoadFailure(ex.Message);
-            lock (loadErrors) loadErrors.Add(fatalLoadError);
-            loadMs = sw.ElapsedMilliseconds;
-            return;
+            // The solution could not be opened (most often a global.json SDK pin that
+            // is not installed, or a broken edit to a project file). Initial load:
+            // degrade to an error state — status must keep working. Reload: keep the
+            // previous snapshot serving and record why the reload failed.
+            ws.Dispose();
+            var msg = HumanizeLoadFailure(ex.Message);
+            if (initial)
+            {
+                fatalLoadError = msg;
+                lock (loadErrors) loadErrors.Add(msg);
+                loadMs = sw.ElapsedMilliseconds;
+            }
+            else
+            {
+                lock (loadErrors) loadErrors.Add($"reload failed (still serving {SnapshotId}): {msg}");
+            }
+            return false;
         }
 
         // Drop analyzer references. We never run analyzers for navigation, and an
         // UnresolvedAnalyzerReference (common in MSBuildWorkspace loads) crashes
         // SymbolFinder operations that compute project checksums. Compiler
         // diagnostics from GetDiagnostics are unaffected.
-        solution = StripAnalyzerReferences(solution!);
+        opened = StripAnalyzerReferences(opened);
 
-        await ProjectCatalogAsync(ct);
+        var (built, total, loaded, failed, docs) = await BuildCatalogAsync(opened, errors, ct);
+
+        var old = workspace;
+        workspace = ws;
+        lock (loadErrors) { loadErrors.Clear(); loadErrors.AddRange(errors); }
+        fatalLoadError = null;
+        projectsTotal = total;
+        projectsLoaded = loaded;
+        projectsFailed = failed;
+        documents = docs;
         loadMs = sw.ElapsedMilliseconds;
+        current = new Snapshot(opened, built, (current?.Version ?? 0) + 1);
+        old?.Dispose();
+        return true;
     }
 
     private static Solution StripAnalyzerReferences(Solution s)
@@ -166,11 +209,11 @@ public sealed class Engine : IDisposable
         throw new ArgumentException($"No single .sln/.slnx/.csproj found in {dir}.");
     }
 
-    private async Task ProjectCatalogAsync(CancellationToken ct)
+    private async Task<(Catalog Catalog, int Total, int Loaded, int Failed, int Documents)> BuildCatalogAsync(
+        Solution sln, List<string> errors, CancellationToken ct)
     {
-        var sln = solution!;
         var built = new Catalog();
-        projectsTotal = sln.Projects.Count();
+        int total = sln.Projects.Count(), loaded = 0, failed = 0, docs = 0;
 
         foreach (var project in sln.Projects)
         {
@@ -184,40 +227,43 @@ public sealed class Engine : IDisposable
             }
             catch (Exception ex)
             {
-                projectsFailed++;
-                lock (loadErrors) loadErrors.Add($"{project.Name}: {ex.Message}");
+                failed++;
+                lock (errors) errors.Add($"{project.Name}: {ex.Message}");
                 continue;
             }
 
             if (comp is null)
             {
-                projectsFailed++;
+                failed++;
                 continue;
             }
 
-            projectsLoaded++;
-            documents += project.Documents.Count();
+            loaded++;
+            docs += project.Documents.Count();
             foreach (var type in EnumerateTypes(comp.Assembly.GlobalNamespace))
-            {
-                AddSymbol(built, type);
-                foreach (var member in type.GetMembers())
-                {
-                    if (member is INamedTypeSymbol)
-                        continue; // nested types come from EnumerateTypes
-                    if (member.IsImplicitlyDeclared)
-                        continue;
-                    // Property/event accessors are navigation noise; the property/event
-                    // itself is the user-facing symbol.
-                    if (member is IMethodSymbol m && m.MethodKind is
-                        MethodKind.PropertyGet or MethodKind.PropertySet or
-                        MethodKind.EventAdd or MethodKind.EventRemove or MethodKind.EventRaise)
-                        continue;
-                    AddSymbol(built, member);
-                }
-            }
+                AddTypeAndMembers(built, type);
         }
 
-        catalog = built;
+        return (built, total, loaded, failed, docs);
+    }
+
+    private void AddTypeAndMembers(Catalog into, INamedTypeSymbol type)
+    {
+        AddSymbol(into, type);
+        foreach (var member in type.GetMembers())
+        {
+            if (member is INamedTypeSymbol)
+                continue; // nested types are projected as types in their own right
+            if (member.IsImplicitlyDeclared)
+                continue;
+            // Property/event accessors are navigation noise; the property/event
+            // itself is the user-facing symbol.
+            if (member is IMethodSymbol m && m.MethodKind is
+                MethodKind.PropertyGet or MethodKind.PropertySet or
+                MethodKind.EventAdd or MethodKind.EventRemove or MethodKind.EventRaise)
+                continue;
+            AddSymbol(into, member);
+        }
     }
 
     private static IEnumerable<INamedTypeSymbol> EnumerateTypes(INamespaceSymbol ns)
@@ -318,22 +364,167 @@ public sealed class Engine : IDisposable
         catch { return null; }
     }
 
+    // ---- Live-edit mutation (single-writer: the watcher's apply loop) --------
+
+    /// <summary>
+    /// Apply a debounced batch of .cs file changes to the current snapshot: an
+    /// existing file gets new text, a missing file's documents are removed, and a
+    /// new file is added to the project(s) whose directory contains it (matching
+    /// SDK-style globbing; multi-TFM projects each get a copy). The whole batch
+    /// yields ONE new (Solution, Catalog) pair and one snapshot_id bump.
+    /// </summary>
+    public async Task ApplyCsBatchAsync(IReadOnlyList<string> absPaths, CancellationToken ct = default)
+    {
+        var snap = Snap();
+        var sln = snap.Solution;
+        var changedRel = new HashSet<string>(StringComparer.Ordinal);
+        var touched = new List<DocumentId>();
+
+        foreach (var raw in absPaths)
+        {
+            ct.ThrowIfCancellationRequested();
+            var abs = Path.GetFullPath(raw);
+            changedRel.Add(RelPath(abs));
+            var ids = sln.GetDocumentIdsWithFilePath(abs);
+            if (File.Exists(abs))
+            {
+                SourceText text;
+                try { text = SourceText.From(File.ReadAllText(abs)); }
+                catch (IOException) { continue; } // mid-write; the next event retries
+                if (!ids.IsEmpty)
+                {
+                    foreach (var id in ids)
+                    {
+                        sln = sln.WithDocumentText(id, text);
+                        touched.Add(id);
+                    }
+                }
+                else
+                {
+                    foreach (var project in ProjectsOwning(sln, abs))
+                    {
+                        var id = DocumentId.CreateNewId(project.Id);
+                        sln = sln.AddDocument(id, Path.GetFileName(abs), text, filePath: abs);
+                        touched.Add(id);
+                    }
+                }
+            }
+            else
+            {
+                foreach (var id in ids)
+                    sln = sln.RemoveDocument(id);
+            }
+        }
+
+        // Rebuild the catalog incrementally: keep entries untouched by this batch,
+        // re-project the touched documents, then re-resolve symbols that were dropped
+        // but still have a declaration in an unchanged file (a partial type whose
+        // other part survives must not vanish from the catalog).
+        var rebuilt = new Catalog();
+        var dropped = new List<SymbolEntry>();
+        foreach (var e in snap.Catalog.All)
+        {
+            if (e.DeclLocations.Any(d => changedRel.Contains(d.RelPath)))
+                dropped.Add(e);
+            else
+                rebuilt.Add(e);
+        }
+
+        foreach (var id in touched.Distinct())
+        {
+            var doc = sln.GetDocument(id);
+            if (doc is null) continue;
+            var model = await doc.GetSemanticModelAsync(ct);
+            var unit = await doc.GetSyntaxRootAsync(ct);
+            if (model is null || unit is null) continue;
+            foreach (var type in DeclaredTypes(model, unit, ct))
+                AddTypeAndMembers(rebuilt, type);
+        }
+
+        foreach (var e in dropped)
+        {
+            if (rebuilt.ByMoniker(e.Moniker) is not null) continue;
+            var survivor = e.DeclLocations.FirstOrDefault(d => !changedRel.Contains(d.RelPath));
+            if (survivor is null) continue;
+            var abs = Path.GetFullPath(Path.Combine(root, survivor.RelPath));
+            var docId = sln.GetDocumentIdsWithFilePath(abs).FirstOrDefault();
+            if (docId is null) continue;
+            var comp = await sln.GetProject(docId.ProjectId)!.GetCompilationAsync(ct);
+            if (comp is null) continue;
+            if (DocumentationCommentId.GetFirstSymbolForDeclarationId(e.Moniker, comp) is { } sym)
+                AddSymbol(rebuilt, sym);
+        }
+
+        documents = sln.Projects.Sum(p => p.Documents.Count());
+        current = new Snapshot(sln, rebuilt, snap.Version + 1);
+    }
+
+    /// <summary>Whether any loaded document lives under the given directory. The
+    /// watcher uses this to detect that a deleted/renamed directory took source
+    /// files with it (inotify reports only the directory, not its children).</summary>
+    public bool HasDocumentsUnder(string absDir)
+    {
+        var snap = current;
+        if (snap is null) return false;
+        var prefix = Path.GetFullPath(absDir).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+        return snap.Solution.Projects.Any(p => p.Documents.Any(d =>
+            d.FilePath is { } f && f.StartsWith(prefix, StringComparison.Ordinal)));
+    }
+
+    /// <summary>Type declarations in one syntax tree (descending into namespaces and
+    /// type bodies for nested types, but not into member bodies). Members are then
+    /// enumerated via the symbol API so the projection matches the full load exactly.</summary>
+    private static IEnumerable<INamedTypeSymbol> DeclaredTypes(SemanticModel model, SyntaxNode unit, CancellationToken ct)
+    {
+        foreach (var node in unit.DescendantNodes(n =>
+                     n is CompilationUnitSyntax or BaseNamespaceDeclarationSyntax or BaseTypeDeclarationSyntax))
+        {
+            if (node is BaseTypeDeclarationSyntax or DelegateDeclarationSyntax
+                && model.GetDeclaredSymbol(node, ct) is INamedTypeSymbol t)
+                yield return t;
+        }
+    }
+
+    /// <summary>Projects whose directory contains the file — the deepest match wins
+    /// (SDK-style projects glob-include .cs under their own directory). Several
+    /// projects can share one directory (multi-TFM); all of them get the file.</summary>
+    private static IEnumerable<Project> ProjectsOwning(Solution sln, string absFile)
+    {
+        var owners = sln.Projects
+            .Where(p => p.Language == LanguageNames.CSharp && p.FilePath is not null)
+            .Select(p => (Project: p, Dir: Path.GetDirectoryName(p.FilePath)!))
+            .Where(t => absFile.StartsWith(t.Dir + Path.DirectorySeparatorChar, StringComparison.Ordinal))
+            .ToList();
+        if (owners.Count == 0)
+            yield break;
+        var deepest = owners.Max(t => t.Dir.Length);
+        foreach (var t in owners.Where(t => t.Dir.Length == deepest))
+            yield return t.Project;
+    }
+
     // ---- Queries -----------------------------------------------------------
 
     /// <summary>True when the solution could not be opened at all.</summary>
-    public bool LoadFailed => solution is null;
+    public bool LoadFailed => current is null;
     public string? FatalLoadError => fatalLoadError;
 
     /// <summary>Some projects/tasks failed to load (e.g. F#/Aspire projects, missing
     /// build tasks); C# navigation still works for what loaded, but completeness is reduced.</summary>
-    private bool Degraded => projectsFailed > 0 || loadErrors.Count > 0;
+    private bool Degraded
+    {
+        get { lock (loadErrors) return projectsFailed > 0 || loadErrors.Count > 0; }
+    }
 
     public Envelope<StatusInfo> Status(ResidentInfo? resident = null)
     {
-        var state = solution is null || projectsLoaded == 0 ? "error" : "ready";
+        var snap = current;
+        var state = snap is null || projectsLoaded == 0 ? "error" : "ready";
+        var snapshotId = snap?.Id ?? "sln@0";
+        string[] errs;
+        lock (loadErrors) errs = loadErrors.ToArray();
         return new Envelope<StatusInfo>
         {
-            SnapshotId = SnapshotId,
+            SnapshotId = snapshotId,
             State = state,
             Degraded = Degraded,
             Items = new[]
@@ -345,7 +536,7 @@ public sealed class Engine : IDisposable
                     Roslyn = "5.3.0",
                     MSBuild = msbuild,
                     Solution = new SolutionInfo { Root = root, File = solutionFile },
-                    SnapshotId = SnapshotId,
+                    SnapshotId = snapshotId,
                     Projects = new ProjectCounts
                     {
                         Total = projectsTotal,
@@ -353,8 +544,8 @@ public sealed class Engine : IDisposable
                         Failed = projectsFailed,
                     },
                     Documents = documents,
-                    Symbols = catalog.Count,
-                    LoadErrors = loadErrors.ToArray(),
+                    Symbols = snap?.Catalog.Count ?? 0,
+                    LoadErrors = errs,
                     LoadMs = loadMs,
                     Resident = resident,
                 }
@@ -364,13 +555,14 @@ public sealed class Engine : IDisposable
 
     public Envelope<SymbolItem> Search(string query, IReadOnlySet<string>? kinds, int limit)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var hits = catalog.Search(query, kinds, limit);
+        var hits = snap.Catalog.Search(query, kinds, limit);
         var items = hits.Select(h => ToSymbolItem(h.Entry, h.Score)).ToArray();
         return new Envelope<SymbolItem>
         {
             Tier = "hot",
-            SnapshotId = SnapshotId,
+            SnapshotId = snap.Id,
             Items = items,
             ElapsedMs = sw.ElapsedMilliseconds,
             Degraded = Degraded,
@@ -379,6 +571,8 @@ public sealed class Engine : IDisposable
 
     public Envelope<OutlineNode> Outline(string relOrAbsPath)
     {
+        var snap = Snap();
+        var catalog = snap.Catalog;
         var sw = Stopwatch.StartNew();
         var rel = catalog.ResolveFile(NormalizeToRel(relOrAbsPath))
                   ?? catalog.ResolveFile(Path.GetFileName(relOrAbsPath.Replace('\\', '/')))
@@ -389,7 +583,7 @@ public sealed class Engine : IDisposable
             return new Envelope<OutlineNode>
             {
                 Ok = false,
-                SnapshotId = SnapshotId,
+                SnapshotId = snap.Id,
                 Error = new ErrorInfo
                 {
                     Code = "invalid_argument",
@@ -407,19 +601,19 @@ public sealed class Engine : IDisposable
         {
             if (e.ContainingMoniker is { } c && inFile.Contains(c))
                 continue; // child; emitted under parent
-            roots.Add(BuildOutline(e, rel));
+            roots.Add(BuildOutline(catalog, e, rel));
         }
 
         return new Envelope<OutlineNode>
         {
             Tier = "hot",
-            SnapshotId = SnapshotId,
+            SnapshotId = snap.Id,
             Items = roots,
             ElapsedMs = sw.ElapsedMilliseconds,
         };
     }
 
-    private OutlineNode BuildOutline(SymbolEntry e, string rel)
+    private OutlineNode BuildOutline(Catalog catalog, SymbolEntry e, string rel)
     {
         var node = new OutlineNode
         {
@@ -435,94 +629,97 @@ public sealed class Engine : IDisposable
                      .Where(c => c.Primary?.RelPath == rel)
                      .OrderBy(c => c.Primary?.Line ?? 0))
         {
-            node.Children.Add(BuildOutline(child, rel));
+            node.Children.Add(BuildOutline(catalog, child, rel));
         }
         return node;
     }
 
-    public Envelope<HoverItem> HoverById(string symbolId)
+    private Envelope<HoverItem> HoverById(Snapshot snap, string symbolId)
     {
-        var e = catalog.ByMoniker(symbolId);
+        var e = snap.Catalog.ByMoniker(symbolId);
         if (e is null)
-            return NotFoundHover();
+            return NotFoundHover(snap);
         return new Envelope<HoverItem>
         {
             Tier = "hot",
-            SnapshotId = SnapshotId,
+            SnapshotId = snap.Id,
             Items = new[] { ToHover(e) },
         };
     }
 
     public async Task<Envelope<SymbolItem>> DefinitionAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
     {
+        var snap = Snap();
         if (!string.IsNullOrEmpty(symbolId))
         {
-            var (moniker, candidates) = NormalizeTargetId(symbolId!);
-            if (candidates is not null) return Ambiguous<SymbolItem>(candidates);
-            var e = catalog.ByMoniker(moniker ?? symbolId!);
+            var (moniker, candidates) = NormalizeTargetId(snap.Catalog, symbolId!);
+            if (candidates is not null) return Ambiguous<SymbolItem>(snap, candidates);
+            var e = snap.Catalog.ByMoniker(moniker ?? symbolId!);
             if (e is null)
-                return SymbolNotFound<SymbolItem>();
+                return SymbolNotFound<SymbolItem>(snap);
             return new Envelope<SymbolItem>
             {
                 Tier = "hot",
-                SnapshotId = SnapshotId,
+                SnapshotId = snap.Id,
                 Items = new[] { ToSymbolItem(e, null) },
             };
         }
 
-        var (sym, _) = await ResolvePositionalAsync(path, line, col, ct);
+        var (sym, _) = await ResolvePositionalAsync(snap, path, line, col, ct);
         if (sym is null)
-            return SymbolNotFound<SymbolItem>();
+            return SymbolNotFound<SymbolItem>(snap);
 
-        var entry = catalog.ByMoniker(sym.GetDocumentationCommentId() ?? "");
+        var entry = snap.Catalog.ByMoniker(sym.GetDocumentationCommentId() ?? "");
         if (entry is not null)
-            return new Envelope<SymbolItem> { Tier = "hot_semantic", SnapshotId = SnapshotId, Items = new[] { ToSymbolItem(entry, null) } };
+            return new Envelope<SymbolItem> { Tier = "hot_semantic", SnapshotId = snap.Id, Items = new[] { ToSymbolItem(entry, null) } };
 
         // metadata symbol
         return new Envelope<SymbolItem>
         {
             Tier = "hot_semantic",
-            SnapshotId = SnapshotId,
+            SnapshotId = snap.Id,
             Items = new[] { ToSymbolItemFromMetadata(sym) },
         };
     }
 
     public async Task<Envelope<HoverItem>> HoverAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
     {
+        var snap = Snap();
         if (!string.IsNullOrEmpty(symbolId))
         {
-            var (moniker, candidates) = NormalizeTargetId(symbolId!);
-            if (candidates is not null) return Ambiguous<HoverItem>(candidates);
-            return HoverById(moniker ?? symbolId!);
+            var (moniker, candidates) = NormalizeTargetId(snap.Catalog, symbolId!);
+            if (candidates is not null) return Ambiguous<HoverItem>(snap, candidates);
+            return HoverById(snap, moniker ?? symbolId!);
         }
 
-        var (sym, _) = await ResolvePositionalAsync(path, line, col, ct);
+        var (sym, _) = await ResolvePositionalAsync(snap, path, line, col, ct);
         if (sym is null)
-            return NotFoundHover();
+            return NotFoundHover(snap);
 
-        var entry = catalog.ByMoniker(sym.GetDocumentationCommentId() ?? "");
+        var entry = snap.Catalog.ByMoniker(sym.GetDocumentationCommentId() ?? "");
         if (entry is not null)
-            return new Envelope<HoverItem> { Tier = "hot_semantic", SnapshotId = SnapshotId, Items = new[] { ToHover(entry) } };
+            return new Envelope<HoverItem> { Tier = "hot_semantic", SnapshotId = snap.Id, Items = new[] { ToHover(entry) } };
 
         return new Envelope<HoverItem>
         {
             Tier = "hot_semantic",
-            SnapshotId = SnapshotId,
+            SnapshotId = snap.Id,
             Items = new[] { ToHoverFromMetadata(sym) },
         };
     }
 
-    private async Task<(ISymbol? Symbol, Document? Doc)> ResolvePositionalAsync(string? path, int? line, int? col, CancellationToken ct)
+    private async Task<(ISymbol? Symbol, Document? Doc)> ResolvePositionalAsync(
+        Snapshot snap, string? path, int? line, int? col, CancellationToken ct)
     {
         if (path is null || line is null || col is null)
             throw new ArgumentException("Positional lookup needs path, line, and col (or pass symbol_id).");
 
         var rel = NormalizeToRel(path);
         var abs = Path.GetFullPath(Path.Combine(root, rel));
-        var docId = solution!.GetDocumentIdsWithFilePath(abs).FirstOrDefault();
+        var docId = snap.Solution.GetDocumentIdsWithFilePath(abs).FirstOrDefault();
         if (docId is null)
             return (null, null);
-        var doc = solution.GetDocument(docId);
+        var doc = snap.Solution.GetDocument(docId);
         if (doc is null)
             return (null, null);
 
@@ -644,7 +841,7 @@ public sealed class Engine : IDisposable
     /// resolution; a non-null candidates list means the name was ambiguous. (null, null)
     /// means the name matched nothing.
     /// </summary>
-    private (string? Moniker, IReadOnlyList<SymbolEntry>? Candidates) NormalizeTargetId(string raw)
+    private static (string? Moniker, IReadOnlyList<SymbolEntry>? Candidates) NormalizeTargetId(Catalog catalog, string raw)
     {
         if (catalog.ByMoniker(raw) is not null) return (raw, null);
         if (raw.Length > 1 && raw[1] == ':') return (raw, null); // doc-comment id shape
@@ -656,14 +853,15 @@ public sealed class Engine : IDisposable
     }
 
     /// <summary>Resolve a target (positional, symbol_id, or bare name) to a live ISymbol.</summary>
-    private async Task<Resolved> ResolveSymbolAsync(string? path, int? line, int? col, string? symbolId, CancellationToken ct)
+    private async Task<Resolved> ResolveSymbolAsync(
+        Snapshot snap, string? path, int? line, int? col, string? symbolId, CancellationToken ct)
     {
         if (!string.IsNullOrEmpty(symbolId))
         {
-            var (moniker, candidates) = NormalizeTargetId(symbolId!);
+            var (moniker, candidates) = NormalizeTargetId(snap.Catalog, symbolId!);
             if (candidates is not null) return new Resolved(null, candidates);
             var id = moniker ?? symbolId!;
-            foreach (var project in solution!.Projects)
+            foreach (var project in snap.Solution.Projects)
             {
                 if (project.Language != LanguageNames.CSharp) continue;
                 var comp = await project.GetCompilationAsync(ct);
@@ -673,20 +871,21 @@ public sealed class Engine : IDisposable
             }
             return new Resolved(null, null);
         }
-        var (s, _) = await ResolvePositionalAsync(path, line, col, ct);
+        var (s, _) = await ResolvePositionalAsync(snap, path, line, col, ct);
         return new Resolved(s, null);
     }
 
     public async Task<Envelope<ReferenceItem>> FindReferencesAsync(
         string? path, int? line, int? col, string? symbolId, bool includeDeclaration, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<ReferenceItem>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<ReferenceItem>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<ReferenceItem>();
+        if (symbol is null) return SymbolNotFound<ReferenceItem>(snap);
 
-        var found = await SymbolFinder.FindReferencesAsync(symbol, solution!, ct);
+        var found = await SymbolFinder.FindReferencesAsync(symbol, snap.Solution, ct);
         var items = new List<ReferenceItem>();
         foreach (var rs in found)
         {
@@ -706,7 +905,7 @@ public sealed class Engine : IDisposable
         var total = items.Count;
         var notes = new List<string>();
         if (total > limit) { items = items.Take(limit).ToList(); notes.Add($"{total} references; showing {limit}"); }
-        return Relational(items, sw, notes);
+        return Relational(snap, items, sw, notes);
     }
 
     // Best-effort read/write/call classification from syntax context (Roslyn's
@@ -731,24 +930,25 @@ public sealed class Engine : IDisposable
     public async Task<Envelope<SymbolItem>> FindImplementationsAsync(
         string? path, int? line, int? col, string? symbolId, string? ofTypeArg, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<SymbolItem>();
+        if (symbol is null) return SymbolNotFound<SymbolItem>(snap);
 
         var results = new List<(ISymbol Sym, string Relation)>();
         if (symbol is INamedTypeSymbol type && type.TypeKind != TypeKind.Interface)
         {
-            foreach (var s in await SymbolFinder.FindDerivedClassesAsync(type, solution!, transitive: true, null, ct))
+            foreach (var s in await SymbolFinder.FindDerivedClassesAsync(type, snap.Solution, transitive: true, null, ct))
                 results.Add((s, "derives"));
         }
         else
         {
-            foreach (var s in await SymbolFinder.FindImplementationsAsync(symbol, solution!, null, ct))
+            foreach (var s in await SymbolFinder.FindImplementationsAsync(symbol, snap.Solution, null, ct))
                 results.Add((s, "implements"));
             if (symbol is not INamedTypeSymbol)
-                foreach (var s in await SymbolFinder.FindOverridesAsync(symbol, solution!, null, ct))
+                foreach (var s in await SymbolFinder.FindOverridesAsync(symbol, snap.Solution, null, ct))
                     results.Add((s, "overrides"));
         }
 
@@ -792,23 +992,24 @@ public sealed class Engine : IDisposable
         if (items.Count == 0) notes.Add("no implementations / derived types found in source");
         if (metaOmitted > 0) notes.Add($"{metaOmitted} metadata implementer(s) omitted (source only)");
         if (items.Count > limit) items = items.Take(limit).ToList();
-        return Relational(items, sw, notes);
+        return Relational(snap, items, sw, notes);
     }
 
     public async Task<Envelope<SymbolItem>> FindInjectorsAsync(
         string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<SymbolItem>();
+        if (symbol is null) return SymbolNotFound<SymbolItem>(snap);
         if (symbol is not INamedTypeSymbol)
-            return InvalidArg<SymbolItem>("select a type (the dependency being injected)");
+            return InvalidArg<SymbolItem>(snap, "select a type (the dependency being injected)");
 
         // A reference to the type that sits inside a constructor parameter's type is an
         // injection site; the constructor's containing class is the injector.
-        var found = await SymbolFinder.FindReferencesAsync(symbol, solution!, ct);
+        var found = await SymbolFinder.FindReferencesAsync(symbol, snap.Solution, ct);
         var seen = new HashSet<string>(StringComparer.Ordinal);
         var items = new List<SymbolItem>();
         foreach (var rs in found)
@@ -832,7 +1033,7 @@ public sealed class Engine : IDisposable
         var notes = new List<string>();
         if (items.Count == 0) notes.Add("no constructor-injection sites found in source");
         if (items.Count > limit) items = items.Take(limit).ToList();
-        return Relational(items, sw, notes);
+        return Relational(snap, items, sw, notes);
     }
 
     // The inverse of `injectors`: the constructor dependencies a type declares (what it
@@ -841,13 +1042,14 @@ public sealed class Engine : IDisposable
     public async Task<Envelope<SymbolItem>> FindDependenciesAsync(
         string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<SymbolItem>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<SymbolItem>();
+        if (symbol is null) return SymbolNotFound<SymbolItem>(snap);
         if (symbol is not INamedTypeSymbol type)
-            return InvalidArg<SymbolItem>("select a type (the class whose constructor dependencies you want)");
+            return InvalidArg<SymbolItem>(snap, "select a type (the class whose constructor dependencies you want)");
 
         // Skip compiler-synthesized constructors — a record's copy ctor takes the record
         // itself as its one parameter and would masquerade as a dependency. Tie-break by
@@ -859,7 +1061,7 @@ public sealed class Engine : IDisposable
             .ToList();
         var notes = new List<string>();
         if (ctors.Count == 0)
-            return Relational(Array.Empty<SymbolItem>(), sw,
+            return Relational(snap, Array.Empty<SymbolItem>(), sw,
                 new List<string> { "no constructor parameters (no injected dependencies)" });
 
         var ctor = ctors[0];
@@ -885,7 +1087,7 @@ public sealed class Engine : IDisposable
             });
         }
         if (items.Count > limit) items = items.Take(limit).ToList();
-        return Relational(items, sw, notes);
+        return Relational(snap, items, sw, notes);
     }
 
     // Outgoing calls (the inverse of `callers`): first-party members used by the
@@ -895,11 +1097,12 @@ public sealed class Engine : IDisposable
     public async Task<Envelope<CallNode>> FindCalleesAsync(
         string? path, int? line, int? col, string? symbolId, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<CallNode>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<CallNode>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<CallNode>();
+        if (symbol is null) return SymbolNotFound<CallNode>(snap);
 
         IEnumerable<IMethodSymbol> methods = symbol switch
         {
@@ -908,7 +1111,7 @@ public sealed class Engine : IDisposable
             _ => Array.Empty<IMethodSymbol>(),
         };
         if (!methods.Any())
-            return InvalidArg<CallNode>("select a method or a type");
+            return InvalidArg<CallNode>(snap, "select a method or a type");
 
         var sites = new Dictionary<string, List<Loc>>(StringComparer.Ordinal);
         var meta = new Dictionary<string, ISymbol>(StringComparer.Ordinal);
@@ -935,7 +1138,7 @@ public sealed class Engine : IDisposable
             foreach (var sref in method.DeclaringSyntaxReferences)
             {
                 var node = await sref.GetSyntaxAsync(ct);
-                var doc = solution!.GetDocument(node.SyntaxTree);
+                var doc = snap.Solution.GetDocument(node.SyntaxTree);
                 if (doc is null) continue;
                 var model = await doc.GetSemanticModelAsync(ct);
                 if (model is null) continue;
@@ -991,7 +1194,7 @@ public sealed class Engine : IDisposable
         if (items.Count == 0) notes.Add("no first-party calls found in source");
         if (metaOmitted > 0) notes.Add($"{metaOmitted} call(s) to metadata/BCL members omitted (source only)");
         if (items.Count > limit) items = items.Take(limit).ToList();
-        return Relational(items, sw, notes);
+        return Relational(snap, items, sw, notes);
     }
 
     // Walk up from a type reference to the class that injects it. The reference must be
@@ -1020,13 +1223,14 @@ public sealed class Engine : IDisposable
     public async Task<Envelope<HierarchyItem>> TypeHierarchyAsync(
         string? path, int? line, int? col, string? symbolId, string direction, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<HierarchyItem>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<HierarchyItem>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<HierarchyItem>();
+        if (symbol is null) return SymbolNotFound<HierarchyItem>(snap);
         if (symbol is not INamedTypeSymbol type)
-            return InvalidArg<HierarchyItem>("select a type, not a member");
+            return InvalidArg<HierarchyItem>(snap, "select a type, not a member");
 
         var items = new List<HierarchyItem>();
         var wantBase = direction is "both" or "base";
@@ -1043,8 +1247,8 @@ public sealed class Engine : IDisposable
         if (wantDerived)
         {
             IEnumerable<INamedTypeSymbol> found = type.TypeKind == TypeKind.Interface
-                ? (await SymbolFinder.FindImplementationsAsync(type, solution!, null, ct)).OfType<INamedTypeSymbol>()
-                : await SymbolFinder.FindDerivedClassesAsync(type, solution!, transitive: true, null, ct);
+                ? (await SymbolFinder.FindImplementationsAsync(type, snap.Solution, null, ct)).OfType<INamedTypeSymbol>()
+                : await SymbolFinder.FindDerivedClassesAsync(type, snap.Solution, transitive: true, null, ct);
             var derived = found.ToList();
             var source = derived.Where(d => d.Locations.Any(l => l.IsInSource)).ToList();
             foreach (var dt in source) items.Add(HierItem(dt, "derived", 1));
@@ -1052,29 +1256,30 @@ public sealed class Engine : IDisposable
                 notes.Add($"{derived.Count - source.Count} metadata derived type(s) omitted (source only)");
         }
         if (items.Count > limit) items = items.Take(limit).ToList();
-        return Relational(items, sw, notes);
+        return Relational(snap, items, sw, notes);
     }
 
     public async Task<Envelope<CallNode>> CallersAsync(
         string? path, int? line, int? col, string? symbolId, int depth, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
-        var res = await ResolveSymbolAsync(path, line, col, symbolId, ct);
-        if (res.Ambiguous is { } amb) return Ambiguous<CallNode>(amb);
+        var res = await ResolveSymbolAsync(snap, path, line, col, symbolId, ct);
+        if (res.Ambiguous is { } amb) return Ambiguous<CallNode>(snap, amb);
         var symbol = res.Symbol;
-        if (symbol is null) return SymbolNotFound<CallNode>();
+        if (symbol is null) return SymbolNotFound<CallNode>(snap);
 
         var visited = new HashSet<string>(StringComparer.Ordinal);
-        var nodes = await CollectCallersAsync(symbol, 1, Math.Max(1, depth), visited, ct);
+        var nodes = await CollectCallersAsync(snap.Solution, symbol, 1, Math.Max(1, depth), visited, ct);
         var notes = nodes.Count == 0 ? new List<string> { "no callers found" } : new();
         if (nodes.Count > limit) nodes = nodes.Take(limit).ToList();
-        return Relational(nodes, sw, notes);
+        return Relational(snap, nodes, sw, notes);
     }
 
     private async Task<List<CallNode>> CollectCallersAsync(
-        ISymbol symbol, int depth, int maxDepth, HashSet<string> visited, CancellationToken ct)
+        Solution solution, ISymbol symbol, int depth, int maxDepth, HashSet<string> visited, CancellationToken ct)
     {
-        var callers = await SymbolFinder.FindCallersAsync(symbol, solution!, ct);
+        var callers = await SymbolFinder.FindCallersAsync(symbol, solution, ct);
         var list = new List<CallNode>();
         foreach (var c in callers)
         {
@@ -1084,7 +1289,7 @@ public sealed class Engine : IDisposable
             var sites = c.Locations.Where(l => l.IsInSource).Select(LocFrom).ToList();
             List<CallNode>? children = null;
             if (depth < maxDepth && id is not null && visited.Add(id))
-                children = await CollectCallersAsync(calling, depth + 1, maxDepth, visited, ct);
+                children = await CollectCallersAsync(solution, calling, depth + 1, maxDepth, visited, ct);
             list.Add(new CallNode
             {
                 SymbolId = id,
@@ -1102,36 +1307,37 @@ public sealed class Engine : IDisposable
     public async Task<Envelope<DiagnosticItem>> DiagnosticsAsync(
         string scope, string? path, string? projectName, string minSeverity, int limit, CancellationToken ct)
     {
+        var snap = Snap();
         var sw = Stopwatch.StartNew();
         var threshold = ParseSeverity(minSeverity);
         var diags = new List<Diagnostic>();
 
         if (scope == "file")
         {
-            if (path is null) return InvalidArg<DiagnosticItem>("file scope requires a path");
+            if (path is null) return InvalidArg<DiagnosticItem>(snap, "file scope requires a path");
             var rel = NormalizeToRel(path);
             var abs = Path.GetFullPath(Path.Combine(root, rel));
-            var docId = solution!.GetDocumentIdsWithFilePath(abs).FirstOrDefault();
-            if (docId is null) return InvalidArg<DiagnosticItem>($"no loaded document for '{rel}'");
-            var model = await solution.GetDocument(docId)!.GetSemanticModelAsync(ct);
+            var docId = snap.Solution.GetDocumentIdsWithFilePath(abs).FirstOrDefault();
+            if (docId is null) return InvalidArg<DiagnosticItem>(snap, $"no loaded document for '{rel}'");
+            var model = await snap.Solution.GetDocument(docId)!.GetSemanticModelAsync(ct);
             if (model is null) return new Envelope<DiagnosticItem>
             {
-                Ok = false, SnapshotId = SnapshotId,
+                Ok = false, SnapshotId = snap.Id,
                 Error = new ErrorInfo { Code = "requires_semantic", Message = "No semantic model for the file.", Retryable = true },
             };
             diags.AddRange(model.GetDiagnostics(null, ct));
         }
         else if (scope == "project")
         {
-            var proj = solution!.Projects.FirstOrDefault(p => p.Name == projectName)
-                       ?? solution.Projects.FirstOrDefault(p => p.Language == LanguageNames.CSharp);
-            if (proj is null) return InvalidArg<DiagnosticItem>("no matching project");
+            var proj = snap.Solution.Projects.FirstOrDefault(p => p.Name == projectName)
+                       ?? snap.Solution.Projects.FirstOrDefault(p => p.Language == LanguageNames.CSharp);
+            if (proj is null) return InvalidArg<DiagnosticItem>(snap, "no matching project");
             var comp = await proj.GetCompilationAsync(ct);
             if (comp is not null) diags.AddRange(comp.GetDiagnostics(ct));
         }
         else // solution
         {
-            foreach (var p in solution!.Projects)
+            foreach (var p in snap.Solution.Projects)
             {
                 if (p.Language != LanguageNames.CSharp) continue;
                 var comp = await p.GetCompilationAsync(ct);
@@ -1158,7 +1364,7 @@ public sealed class Engine : IDisposable
         if (refErrs > 0)
             notes.Add($"{refErrs} reference-resolution error(s) — the target looks unrestored; run a build/restore for reliable diagnostics");
         if (items.Count > limit) { notes.Add($"{items.Count} diagnostics; showing {limit}"); items = items.Take(limit).ToList(); }
-        return Relational(items, sw, notes, degraded: refErrs > 0);
+        return Relational(snap, items, sw, notes, degraded: refErrs > 0);
     }
 
     private static DiagnosticSeverity ParseSeverity(string s) => s.ToLowerInvariant() switch
@@ -1194,10 +1400,10 @@ public sealed class Engine : IDisposable
     private static readonly HashSet<string> ReferenceResolutionErrors =
         new(StringComparer.Ordinal) { "CS0006", "CS0009", "CS0012", "CS0234", "CS0246" };
 
-    private Envelope<T> Relational<T>(IReadOnlyList<T> items, Stopwatch sw, List<string> notes, bool degraded = false) => new()
+    private Envelope<T> Relational<T>(Snapshot snap, IReadOnlyList<T> items, Stopwatch sw, List<string> notes, bool degraded = false) => new()
     {
         Tier = "relational",
-        SnapshotId = SnapshotId,
+        SnapshotId = snap.Id,
         Items = items,
         ElapsedMs = sw.ElapsedMilliseconds,
         Degraded = Degraded || degraded,
@@ -1257,16 +1463,16 @@ public sealed class Engine : IDisposable
         };
     }
 
-    private Envelope<T> InvalidArg<T>(string message) => new()
+    private Envelope<T> InvalidArg<T>(Snapshot snap, string message) => new()
     {
         Ok = false,
-        SnapshotId = SnapshotId,
+        SnapshotId = snap.Id,
         Error = new ErrorInfo { Code = "invalid_argument", Message = message, Retryable = false },
     };
 
     // A bare name matched more than one declaration. Report the candidates (with their
     // symbol_ids) so the caller can re-run precisely via --id or file:line:col.
-    private Envelope<T> Ambiguous<T>(IReadOnlyList<SymbolEntry> cands)
+    private Envelope<T> Ambiguous<T>(Snapshot snap, IReadOnlyList<SymbolEntry> cands)
     {
         const int Max = 25;
         var shown = cands
@@ -1284,22 +1490,22 @@ public sealed class Engine : IDisposable
         return new Envelope<T>
         {
             Ok = false,
-            SnapshotId = SnapshotId,
+            SnapshotId = snap.Id,
             Error = new ErrorInfo { Code = "ambiguous_symbol", Message = msg, Retryable = false },
         };
     }
 
-    private Envelope<HoverItem> NotFoundHover() => new()
+    private Envelope<HoverItem> NotFoundHover(Snapshot snap) => new()
     {
         Ok = false,
-        SnapshotId = SnapshotId,
+        SnapshotId = snap.Id,
         Error = new ErrorInfo { Code = "symbol_not_found", Message = "No symbol at the given target.", Retryable = false },
     };
 
-    private Envelope<T> SymbolNotFound<T>() => new()
+    private Envelope<T> SymbolNotFound<T>(Snapshot snap) => new()
     {
         Ok = false,
-        SnapshotId = SnapshotId,
+        SnapshotId = snap.Id,
         Error = new ErrorInfo { Code = "symbol_not_found", Message = "No symbol at the given target.", Retryable = false },
     };
 

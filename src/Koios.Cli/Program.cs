@@ -21,11 +21,14 @@ abstract class GlobalOptions
 [Verb("status", HelpText = "Load the solution and report health.")]
 sealed class StatusOptions : GlobalOptions { }
 
-[Verb("serve", HelpText = "Load the solution once and stay resident, serving queries over a local socket (foreground; Ctrl+C to stop). Serves a fixed snapshot — restart to pick up on-disk edits.")]
+[Verb("serve", HelpText = "Load the solution once and stay resident, serving queries over a local socket (foreground; Ctrl+C to stop). A file watcher keeps the snapshot current as you edit.")]
 sealed class ServeOptions : GlobalOptions
 {
     [Option("idle-timeout", Default = 15, HelpText = "Minutes of inactivity before the resident self-shuts down.")]
     public int IdleTimeout { get; set; }
+
+    [Option("no-watch", HelpText = "Disable the file watcher and serve a fixed snapshot.")]
+    public bool NoWatch { get; set; }
 }
 
 [Verb("stop", HelpText = "Stop the resident server for the solution.")]
@@ -309,6 +312,7 @@ static class Cli
 
         using var server = new Server(engine, sock, TimeSpan.FromMinutes(o.IdleTimeout));
         server.Start();
+        using var watcher = o.NoWatch ? null : TryStartWatcher(engine, server.ShutdownToken);
 
         var done = new TaskCompletionSource();
         using var reg = server.ShutdownToken.Register(() => done.TrySetResult());
@@ -316,6 +320,26 @@ static class Cli
         await done.Task;
         Console.Error.WriteLine("stopped.");
         return 0;
+    }
+
+    // The watcher is best-effort: if it cannot start (e.g. the inotify watch limit
+    // on a huge tree), serve degrades to the old fixed-snapshot behavior.
+    static Watcher? TryStartWatcher(Engine engine, CancellationToken shutdownToken)
+    {
+        var watcher = new Watcher(engine, shutdownToken);
+        watcher.Log += msg => Console.Error.WriteLine(msg);
+        try
+        {
+            watcher.Start();
+            Console.Error.WriteLine($"watching {engine.Root} for changes");
+            return watcher;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"watch: could not start ({ex.Message}); serving a fixed snapshot");
+            watcher.Dispose();
+            return null;
+        }
     }
 
     static async Task<int> StopAsync(StopOptions o)

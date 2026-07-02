@@ -12,7 +12,12 @@ built on Roslyn.
   - `RepoSdk.cs` — auto-detects a repo-local `.dotnet/` (or user-level `~/.dotnet`)
     and points the SDK resolver at it. Called before bootstrap.
   - `Engine.cs` — loads the workspace, projects the catalog, answers queries.
+    Holds one volatile immutable `Snapshot(Solution, Catalog, Version)`; queries
+    capture it once at entry. Single-writer mutation API for live edits
+    (`ApplyCsBatchAsync`, `ReloadAsync`, `HasDocumentsUnder`).
   - `Catalog.cs` — in-memory symbol projection + indexes + ranked search.
+  - `Watcher.cs` — `FileSystemWatcher` + debounce + batch classification; the
+    engine's single writer (see live-edits notes below).
   - `Display.cs` — custom SymbolDisplayFormats (FQN, signature, type signature).
   - `Models.cs` — the canonical response envelope + result DTOs (snake_case JSON).
   - `Protocol.cs` — wire model (`Request`/`RequestArgs`, newline-delimited compact JSON)
@@ -32,12 +37,12 @@ built on Roslyn.
 
 ## Current state
 
-Foundation & HOT-query tier, relational queries, and the resident server complete
-(see the README roadmap). CLI commands: `serve`, `stop` (lifecycle); `status`,
-`search`, `outline`, `def`, `hover` (hot); `refs`, `callers`,
-`impls` (with `--of <TypeArg>` for closed-generic filtering), `injectors`,
-`hierarchy`, `diagnostics` (relational, via `SymbolFinder` / compiler diagnostics).
-No watcher, SQLite, or MCP server yet.
+Foundation & HOT-query tier, relational queries, the resident server, and live
+edits complete (see the README roadmap). CLI commands: `serve`, `stop`
+(lifecycle); `status`, `search`, `outline`, `def`, `hover` (hot); `refs`,
+`callers`, `impls` (with `--of <TypeArg>` for closed-generic filtering),
+`injectors`, `hierarchy`, `diagnostics` (relational, via `SymbolFinder` /
+compiler diagnostics). No SQLite or MCP server yet.
 
 Resident model:
 - `koios serve` cold-loads the workspace once and holds the warm `Engine`; every query
@@ -49,8 +54,38 @@ Resident model:
   `Server` serializes the dispatch result by its runtime type so the boxed
   `Envelope<T>` emits its real shape. `status` is answered by the server (it stamps
   `ResidentInfo`: pid/uptime/requests); all other verbs go through `Dispatcher`.
-- Fixed snapshot: on-disk edits are not reflected until `serve` is restarted (watcher
-  is a later step). Idle-timeout (`--idle-timeout`, default 15 min) self-shuts down.
+- Idle-timeout (`--idle-timeout`, default 15 min) self-shuts down. `--no-watch`
+  serves a fixed snapshot (also the fallback if the watcher can't start, e.g.
+  inotify watch limits).
+
+Live edits (watcher):
+- `Watcher` (started by `serve`) coalesces fs events into one pending batch and
+  applies it after a 250 ms quiet period (the debounce extends while events keep
+  streaming, so a `git checkout` lands as ONE batch). `bin/`, `obj/`, `.git/`,
+  `.vs/`, `.idea/`, `node_modules/` are ignored at the event source; a directory
+  Changed event is dropped (child-mtime noise); a directory that *appears*
+  (created/moved in) is scanned recursively because its children never raised
+  events.
+- Single-writer discipline: the watcher's apply loop is the only caller of the
+  Engine mutation API. Queries capture the volatile `Snapshot` once per request,
+  so in-flight queries stay consistent across a swap. Every swap bumps
+  `snapshot_id` (`sln@N`).
+- `.cs`-only batches go through `ApplyCsBatchAsync`: `WithDocumentText` /
+  `AddDocument` (into the deepest project whose dir contains the file; multi-TFM
+  → all of them) / `RemoveDocument`, then an incremental catalog rebuild — drop
+  entries declared in touched files, re-project only the touched documents, and
+  re-resolve partial types whose other parts live in unchanged files. One swap
+  per batch (~tens of ms; ~1 s for a 300-file storm on a 57k-symbol solution).
+- Full background reload instead (old snapshot keeps serving until the swap;
+  on failure it KEEPS serving and the error lands in `status.load_errors`) when
+  the batch contains: a project-graph file (`.csproj`/`.props`/`.targets`/
+  `.sln`/`.slnx`/`.slnf`/`global.json`/`nuget.config` — `MSBuildWorkspace` has
+  no clean single-project reload), a watcher overflow, a deleted directory that
+  held loaded documents (inotify reports only the dir), or >500 changed `.cs`
+  files.
+- Blind spot (accepted): a bare `dotnet restore` with no project-file edit
+  changes only `obj/` (ignored), so new package refs need a csproj touch or
+  restart to be seen.
 
 Target resolution (`def`/`hover`/`refs`/`callers`/`impls`/`hierarchy`):
 - A target is `file:line:col`, a `symbol_id` (doc-comment id), or a **bare name**.
