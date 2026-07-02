@@ -12,8 +12,28 @@ public static class RuntimeDir
         var xdg = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
         if (!string.IsNullOrEmpty(xdg) && Directory.Exists(xdg)) return xdg;
         var tmp = Environment.GetEnvironmentVariable("TMPDIR");
-        if (!string.IsNullOrEmpty(tmp) && Directory.Exists(tmp)) return tmp;
-        return "/tmp";
+        var baseDir = !string.IsNullOrEmpty(tmp) && Directory.Exists(tmp) ? tmp : "/tmp";
+        return PrivateSubdir(baseDir);
+    }
+
+    // XDG_RUNTIME_DIR is per-user 0700 by spec, but TMPDIR//tmp may be shared with
+    // other local users — keep sockets in a private per-user subdir there so nobody
+    // else can connect to (or swap out) a resident's socket.
+    static string PrivateSubdir(string baseDir)
+    {
+        var dir = Path.Combine(baseDir, $"koios-{Environment.UserName}");
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(dir);
+            return dir;
+        }
+        const UnixFileMode Private = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute;
+        Directory.CreateDirectory(dir, Private);
+        if (new DirectoryInfo(dir).LinkTarget is not null)
+            throw new IOException($"Refusing to use '{dir}': it is a symlink.");
+        if (File.GetUnixFileMode(dir) != Private)
+            File.SetUnixFileMode(dir, Private); // pre-existing dir we don't own → UnauthorizedAccessException, deliberately loud
+        return dir;
     }
 
     /// <summary>Stable per-solution socket path: {runtimeDir}/koios-{sha256(absPath)[..16]}.sock</summary>
