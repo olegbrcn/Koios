@@ -57,10 +57,34 @@ public static class Protocol
         return new RequestArgs { SymbolId = target };
     }
 
+    // Relational verbs run SymbolFinder / full compilations (~hundreds of ms); their
+    // results are memoized per (verb, args, snapshot_id). Hot verbs are already ~ms
+    // and are not cached.
+    private static readonly HashSet<string> Memoized = new(StringComparer.Ordinal)
+        { "refs", "callers", "callees", "impls", "injectors", "deps", "hierarchy", "diagnostics" };
+
     // Single mapping from verb to Engine call, shared by every transport. Returns the
     // boxed Envelope<T> (serialize via its runtime type). `status` is handled by the
     // server (it injects ResidentInfo) and so is not reached here in practice.
     public static async Task<object> DispatchAsync(Engine engine, Request req, CancellationToken ct)
+    {
+        if (!Memoized.Contains(req.Verb))
+            return await ExecuteAsync(engine, req, ct);
+
+        var argsKey = JsonSerializer.Serialize(req.Args, Wire);
+        if (engine.Cache.TryGet($"{req.Verb}|{engine.SnapshotId}|{argsKey}", out var hit))
+            return hit;
+
+        var result = await ExecuteAsync(engine, req, ct);
+        // Only successful envelopes are cached, stored under the snapshot that
+        // actually answered (it can differ from the one probed above if the
+        // watcher swapped mid-request).
+        if (result is IEnvelope { Ok: true } env)
+            engine.Cache.Set($"{req.Verb}|{env.SnapshotId}|{argsKey}", result);
+        return result;
+    }
+
+    private static async Task<object> ExecuteAsync(Engine engine, Request req, CancellationToken ct)
     {
         var a = req.Args;
         return req.Verb switch

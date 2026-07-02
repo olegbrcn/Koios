@@ -82,8 +82,9 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
 - <a id="relational-queries"></a>**Relational queries** (done)
   `refs`, `callers`/`callees`, `impls` (with `--of`), `injectors`/`deps`,
   `hierarchy`, and `diagnostics` via Roslyn `SymbolFinder` / compiler
-  diagnostics — the capability that most decisively beats grep. (Result
-  memoization is a later increment now that the resident host exists.)
+  diagnostics — the capability that most decisively beats grep. Results are
+  memoized per `(verb, args, snapshot_id)` in a bounded LRU, so repeated agent
+  queries answer in ~ms; the watcher's snapshot bump invalidates naturally.
 - <a id="resident-server"></a>**Resident server** (done)
   `koios serve` holds the warm `Engine` and answers over a per-solution Unix domain
   socket; every verb is a thin client (`koios stop` / idle-timeout end it). A single
@@ -111,7 +112,7 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   ships with distribution (below).
 - <a id="persistence--warm-start"></a>**Persistence & warm start**
   Write-through SQLite mirror of the catalog for instant warm-start and an offline
-  CLI fallback. (Relational memoization keyed by `snapshot_id` lands alongside.)
+  CLI fallback.
 
 ## Usage
 

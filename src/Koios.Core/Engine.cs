@@ -42,6 +42,10 @@ public sealed class Engine : IDisposable
     public string Root => root;
     public string SnapshotId => current?.Id ?? "sln@0";
 
+    /// <summary>Memoized relational results (see Protocol.DispatchAsync). Keys embed
+    /// the snapshot_id, so snapshot swaps invalidate without any explicit flush.</summary>
+    public QueryCache Cache { get; } = new(capacity: 512);
+
     public IReadOnlyList<string> LoadErrors { get { lock (loadErrors) return loadErrors.ToArray(); } }
 
     private Snapshot Snap() => current ?? throw new InvalidOperationException("engine not loaded");

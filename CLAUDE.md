@@ -53,8 +53,17 @@ commands: `serve`, `stop` (lifecycle); `status`, `search`, `outline`, `def`,
 `hover` (hot); `refs`, `callers`, `impls` (with `--of <TypeArg>` for
 closed-generic filtering), `injectors`, `hierarchy`, `diagnostics` (relational,
 via `SymbolFinder` / compiler diagnostics). Every verb is also a `koios_*` MCP
-tool. No relational memoization or SQLite warm-start yet; target parsing and
-JSON shape are shared via `Protocol.TargetArgs` / `Protocol.Pretty`.
+tool. No SQLite warm-start yet; target parsing and JSON shape are shared via
+`Protocol.TargetArgs` / `Protocol.Pretty`.
+
+Relational memoization:
+- `Protocol.DispatchAsync` memoizes the relational verbs (refs/callers/callees/
+  impls/injectors/deps/hierarchy/diagnostics) in `Engine.Cache` (`QueryCache`,
+  LRU, 512 entries). Key = verb + wire-serialized args + `snapshot_id`, so a
+  watcher swap invalidates without a flush; only `Ok` envelopes are cached
+  (stored under the snapshot that actually answered). Hot verbs are ~ms already
+  and are not cached. A cached envelope is returned as-is, `elapsed_ms`
+  included — it reports the original compute time, not the hit.
 
 Resident model:
 - `koios serve` cold-loads the workspace once and holds the warm `Engine`; every query

@@ -2,8 +2,16 @@ using System.Text.Json.Serialization;
 
 namespace Koios.Core;
 
+// Untyped view of an envelope, for code that holds the boxed Envelope<T>
+// (the dispatcher's cache checks Ok/SnapshotId without knowing T).
+public interface IEnvelope
+{
+    bool Ok { get; }
+    string SnapshotId { get; }
+}
+
 // Canonical response envelope, trimmed to what the first iteration needs.
-public sealed class Envelope<T>
+public sealed class Envelope<T> : IEnvelope
 {
     [JsonPropertyName("schema_version")] public int SchemaVersion { get; init; } = 1;
     [JsonPropertyName("ok")] public bool Ok { get; init; } = true;

@@ -230,12 +230,18 @@ static class Cli
         o.Solution ?? Environment.GetEnvironmentVariable("KOIOS_SOLUTION") ?? Directory.GetCurrentDirectory();
 
     // Every query verb routes to the resident; without one it fails with an actionable
-    // error (queries never cold-load — the only cold load is `serve`).
+    // error (queries never cold-load — the only cold load is `serve`). No pre-probe:
+    // the query connects directly, and a connect failure IS the no-resident signal.
     static async Task<int> Route<T>(GlobalOptions opts, Request request, Action<Envelope<T>> renderer)
     {
         var solution = ResolveSolution(opts);
         var sock = RuntimeDir.SocketPathFor(solution);
-        if (!SocketClient.IsRunning(sock))
+        try
+        {
+            var env = await SocketClient.QueryAsync<T>(sock, request, default);
+            return Emit(env, opts.Format, renderer);
+        }
+        catch (System.Net.Sockets.SocketException)
         {
             var env = new Envelope<T>
             {
@@ -249,11 +255,6 @@ static class Cli
                     Retryable = false,
                 },
             };
-            return Emit(env, opts.Format, renderer);
-        }
-        try
-        {
-            var env = await SocketClient.QueryAsync<T>(sock, request, default);
             return Emit(env, opts.Format, renderer);
         }
         catch (Exception ex)
