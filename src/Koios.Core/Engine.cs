@@ -86,7 +86,7 @@ public sealed class Engine : IDisposable
         var ws = MSBuildWorkspace.Create(props);
         ws.SkipUnrecognizedProjects = true;
         var errors = new List<string>();
-        ws.WorkspaceFailed += (_, e) =>
+        using var failedRegistration = ws.RegisterWorkspaceFailedHandler(e =>
         {
             if (e.Diagnostic.Kind != WorkspaceDiagnosticKind.Failure)
                 return;
@@ -97,7 +97,7 @@ public sealed class Engine : IDisposable
                 || msg.Contains("known moderate severity vulnerability"))
                 return;
             lock (errors) errors.Add(msg);
-        };
+        });
 
         Solution opened;
         try
