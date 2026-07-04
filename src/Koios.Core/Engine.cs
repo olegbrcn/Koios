@@ -1137,6 +1137,12 @@ public sealed class Engine : IDisposable
             if (loc.IsInSource) list.Add(LocFrom(loc));
         }
 
+        void RecordDeconstruction(DeconstructionInfo info, Location loc)
+        {
+            if (info.Method is { } m) Record(m, loc);
+            foreach (var nested in info.Nested) RecordDeconstruction(nested, loc);
+        }
+
         foreach (var method in methods)
         {
             foreach (var sref in method.DeclaringSyntaxReferences)
@@ -1171,6 +1177,40 @@ public sealed class Engine : IDisposable
                             // enclosing member-access) counts each access exactly once.
                             if (model.GetSymbolInfo(name, ct).Symbol is IPropertySymbol prop)
                                 Record(prop, name.GetLocation());
+                            break;
+                        }
+                        case BinaryExpressionSyntax or PrefixUnaryExpressionSyntax
+                            or PostfixUnaryExpressionSyntax or CastExpressionSyntax:
+                        {
+                            // User-defined operators and explicit conversion operators.
+                            // (Implicit conversions have no syntax node and are not walked.)
+                            if (model.GetSymbolInfo(n, ct).Symbol is IMethodSymbol
+                                { MethodKind: MethodKind.UserDefinedOperator or MethodKind.Conversion } op)
+                                Record(op, n.GetLocation());
+                            break;
+                        }
+                        case AssignmentExpressionSyntax assign:
+                        {
+                            // Compound assignment via user-defined operators (a += b) …
+                            if (model.GetSymbolInfo(assign, ct).Symbol is IMethodSymbol
+                                { MethodKind: MethodKind.UserDefinedOperator } op)
+                                Record(op, assign.GetLocation());
+                            // … and deconstructions: (a, b) = e / var (a, b) = e.
+                            else if (assign.IsKind(SyntaxKind.SimpleAssignmentExpression)
+                                && assign.Left is TupleExpressionSyntax or DeclarationExpressionSyntax)
+                                RecordDeconstruction(model.GetDeconstructionInfo(assign), assign.GetLocation());
+                            break;
+                        }
+                        case CommonForEachStatementSyntax fe:
+                        {
+                            // foreach / await foreach pattern members, incl. the Deconstruct
+                            // behind foreach (var (a, b) in …).
+                            var info = model.GetForEachStatementInfo(fe);
+                            foreach (var m in new ISymbol?[]
+                                { info.GetEnumeratorMethod, info.MoveNextMethod, info.CurrentProperty, info.DisposeMethod })
+                                if (m is not null) Record(m, fe.Expression.GetLocation());
+                            if (fe is ForEachVariableStatementSyntax fev)
+                                RecordDeconstruction(model.GetDeconstructionInfo(fev), fev.Variable.GetLocation());
                             break;
                         }
                     }
