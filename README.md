@@ -109,10 +109,7 @@ Each step is a vertical slice that leaves the tool usable end-to-end.
   `loading` meanwhile) and the file watcher keeps it current. Registered for
   this repo via `.mcp.json` + a skill (`.claude/skills/koios/SKILL.md`) that
   steers agents to `koios_*` over grep/Read. Marketplace-style plugin packaging
-  ships with distribution (below).
-- <a id="persistence--warm-start"></a>**Persistence & warm start**
-  Write-through SQLite mirror of the catalog for instant warm-start and an offline
-  CLI fallback.
+  ships with distribution.
 
 ## Usage
 

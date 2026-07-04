@@ -53,7 +53,7 @@ commands: `serve`, `stop` (lifecycle); `status`, `search`, `outline`, `def`,
 `hover` (hot); `refs`, `callers`, `impls` (with `--of <TypeArg>` for
 closed-generic filtering), `injectors`, `hierarchy`, `diagnostics` (relational,
 via `SymbolFinder` / compiler diagnostics). Every verb is also a `koios_*` MCP
-tool. No SQLite warm-start yet; target parsing and JSON shape are shared via
+tool. Target parsing and JSON shape are shared via
 `Protocol.TargetArgs` / `Protocol.Pretty`.
 
 Relational memoization:
